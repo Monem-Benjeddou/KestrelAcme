@@ -8,8 +8,8 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
 
     <PackageId>KestrelAcme</PackageId>
-    <Description>Automatic HTTPS for ASP.NET Core: issues and renews Let's Encrypt (ACME) certificates for Kestrel, with HTTP-01 and TLS-ALPN-01 challenges, ARI renewal windows and zero-downtime certificate swaps.</Description>
-    <PackageTags>acme;letsencrypt;https;tls;certificate;kestrel;aspnetcore</PackageTags>
+    <Description>Automatic HTTPS for ASP.NET Core: issues and renews Let's Encrypt (ACME) certificates for Kestrel, in-process. HTTP-01, TLS-ALPN-01 and DNS-01 challenges (wildcard certificates), ARI renewal windows and certificate swaps without restart. Windows, Linux and macOS.</Description>
+    <PackageTags>acme;letsencrypt;https;tls;ssl;certificate;wildcard;dns-01;kestrel;aspnetcore</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
