@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+
+      - uses: actions/cache@v6
+        with:
+          path: .pebble
+          key: pebble-${{ runner.os }}-${{ hashFiles('eng/pebble.*') }}
+
+      - name: Build Pebble (Linux, macOS)
+        if: runner.os != 'Windows'
+        run: eng/pebble.sh
+      - name: Build Pebble (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: eng/pebble.ps1
+
+      # Unit tests and the Pebble integration tests (real Kestrel, HTTP-01, TLS-ALPN-01, renewal), on .NET 8 and 10.
+      - run: dotnet test -c Release --logger "console;verbosity=normal"
+
+  pack:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - run: dotnet pack src/KestrelAcme -c Release -o artifacts
+      - uses: actions/upload-artifact@v7
+        with:
+          name: nupkg
+          path: artifacts/*

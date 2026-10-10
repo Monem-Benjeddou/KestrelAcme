@@ -1,0 +1,8 @@
+bin/
+obj/
+artifacts/
+.pebble/
+.vs/
+.idea/
+*.user
+TestResults/

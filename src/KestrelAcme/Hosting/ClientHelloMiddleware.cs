@@ -1,0 +1,61 @@
+using Microsoft.AspNetCore.Connections;
+using Microsoft.Extensions.Logging;
+
+namespace KestrelAcme.Hosting;
+
+/// <summary>
+/// Kestrel connection middleware that runs before TLS: it looks at the ClientHello without consuming it and
+/// stores the result as a connection feature, for <see cref="KestrelOptionsSetup"/> to pick the certificate.
+/// </summary>
+internal sealed class ClientHelloMiddleware(ConnectionDelegate next, ILogger logger)
+{
+    private static readonly TimeSpan PeekTimeout = TimeSpan.FromSeconds(5);
+
+    public async Task InvokeAsync(ConnectionContext connection)
+    {
+        if (await PeekAsync(connection).ConfigureAwait(false) is { } clientHello)
+            connection.Features.Set(clientHello);
+
+        await next(connection).ConfigureAwait(false);
+    }
+
+    private async Task<ClientHello?> PeekAsync(ConnectionContext connection)
+    {
+        var input = connection.Transport.Input;
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(connection.ConnectionClosed);
+        timeout.CancelAfter(PeekTimeout);
+
+        try
+        {
+            while (true)
+            {
+                var result = await input.ReadAsync(timeout.Token).ConfigureAwait(false);
+                var buffer = result.Buffer;
+                var status = ClientHelloParser.TryParse(buffer, out var clientHello);
+
+                if (status == ClientHelloParseResult.Incomplete
+                    && !result.IsCompleted
+                    && buffer.Length < ClientHelloParser.MaxClientHelloLength)
+                {
+                    // Nothing consumed, everything examined: the next read waits for more bytes.
+                    input.AdvanceTo(buffer.Start, buffer.End);
+                    continue;
+                }
+
+                // Nothing consumed or examined: the TLS layer reads the same bytes again, straight away.
+                input.AdvanceTo(buffer.Start);
+                return status == ClientHelloParseResult.Success ? clientHello : null;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // The client was slow or went away. Let the TLS layer deal with it as usual.
+            return null;
+        }
+        catch (Exception e)
+        {
+            Log.ClientHelloPeekFailed(logger, connection.ConnectionId, e);
+            return null;
+        }
+    }
+}
