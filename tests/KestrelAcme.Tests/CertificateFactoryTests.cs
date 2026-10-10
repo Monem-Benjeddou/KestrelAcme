@@ -67,6 +67,13 @@ public class CertificateFactoryTests
 
         var reloaded = CertificateFactory.FromPfx(CertificateFactory.ToPfx(bundle));
 
+        // .NET 8 on Windows deleted keys imported through a collection at the next GC, while still in use.
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        reloaded.Leaf.GetECDsaPrivateKey()!.SignData([1, 2, 3], HashAlgorithmName.SHA256);
+        Assert.NotEmpty(CertificateFactory.ToPfx(reloaded));
+
         Assert.Equal(bundle.Leaf.Thumbprint, reloaded.Leaf.Thumbprint);
         Assert.True(reloaded.Leaf.HasPrivateKey);
         Assert.Equal(ca.Thumbprint, Assert.Single(reloaded.Intermediates).Thumbprint);

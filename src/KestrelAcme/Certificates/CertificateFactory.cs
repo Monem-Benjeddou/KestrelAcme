@@ -81,48 +81,51 @@ internal static class CertificateFactory
 
     public static CertificateBundle FromPfx(byte[] pfx, bool isFallback = false)
     {
-        var collection = LoadPkcs12(pfx);
-        X509Certificate2? leaf = null;
-        var intermediates = new X509Certificate2Collection();
-        foreach (var certificate in collection)
-        {
-            if (leaf is null && certificate.HasPrivateKey)
-                leaf = certificate;
-            else
-                intermediates.Add(certificate);
-        }
-
-        return new CertificateBundle(
-            leaf ?? throw new CryptographicException("The PKCS#12 data contains no certificate with a private key."),
-            intermediates,
-            isFallback);
-    }
-
-    private static X509Certificate2Collection LoadPkcs12(byte[] pfx)
-    {
         // Exportable: the bundle is written back to the store after issuance, and macOS and Windows refuse to
         // export a key imported without it. Not EphemeralKeySet: SChannel can't use ephemeral keys.
         try
         {
-            return LoadPkcs12(pfx, X509KeyStorageFlags.Exportable);
+            return FromPfx(pfx, X509KeyStorageFlags.Exportable, isFallback);
         }
         catch (CryptographicException) when (OperatingSystem.IsWindows())
         {
             // Accounts without a loaded user profile (some service accounts, IIS app pools with
             // LoadUserProfile=false) have no user key store. The machine key store works for them.
-            return LoadPkcs12(pfx, X509KeyStorageFlags.Exportable | X509KeyStorageFlags.MachineKeySet);
+            return FromPfx(pfx, X509KeyStorageFlags.Exportable | X509KeyStorageFlags.MachineKeySet, isFallback);
         }
     }
 
-    private static X509Certificate2Collection LoadPkcs12(byte[] pfx, X509KeyStorageFlags flags)
+    private static CertificateBundle FromPfx(byte[] pfx, X509KeyStorageFlags flags, bool isFallback)
     {
 #if NET9_0_OR_GREATER
-        return X509CertificateLoader.LoadPkcs12Collection(pfx, password: null, flags);
+        var collection = X509CertificateLoader.LoadPkcs12Collection(pfx, password: null, flags);
+        var leaf = collection.FirstOrDefault(c => c.HasPrivateKey)
+            ?? throw new CryptographicException("The PKCS#12 data contains no certificate with a private key.");
 #else
+        // On .NET 8 for Windows, a key imported through X509Certificate2Collection.Import is deleted at the next
+        // garbage collection, even while the certificate is still in use ("Keyset does not exist"), so SChannel
+        // drops the handshake. The single-certificate constructor ties the key to that certificate instead.
+        // It picks the certificate that has a private key.
+        var leaf = new X509Certificate2(pfx, (string?)null, flags);
+        if (!leaf.HasPrivateKey)
+            throw new CryptographicException("The PKCS#12 data contains no certificate with a private key.");
+
+        // Only the public intermediates are taken from the collection.
         var collection = new X509Certificate2Collection();
-        collection.Import(pfx, password: null, flags);
-        return collection;
+        collection.Import(pfx, password: null, X509KeyStorageFlags.DefaultKeySet);
 #endif
+        var intermediates = new X509Certificate2Collection();
+        foreach (var certificate in collection)
+        {
+            if (ReferenceEquals(certificate, leaf))
+                continue;
+            if (certificate.Thumbprint == leaf.Thumbprint || certificate.HasPrivateKey)
+                certificate.Dispose();
+            else
+                intermediates.Add(certificate);
+        }
+
+        return new CertificateBundle(leaf, intermediates, isFallback);
     }
 
     /// <summary>A self-signed certificate served while no real certificate exists yet, so handshakes don't fail outright.</summary>
