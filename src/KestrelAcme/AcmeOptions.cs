@@ -3,7 +3,10 @@ namespace KestrelAcme;
 /// <summary>Settings for obtaining and renewing certificates from an ACME certificate authority.</summary>
 public sealed class AcmeOptions
 {
-    /// <summary>The domain names the certificate covers. The first one becomes the subject.</summary>
+    /// <summary>
+    /// The domain names the certificate covers. The first one becomes the subject. Wildcards
+    /// (<c>*.example.com</c>) need an <see cref="IDnsChallengeProvider"/>.
+    /// </summary>
     public IList<string> Domains { get; } = new List<string>();
 
     /// <summary>Contact address the certificate authority uses for expiry and policy notices. Optional.</summary>
@@ -18,8 +21,17 @@ public sealed class AcmeOptions
     /// <summary>The ACME directory URL. Defaults to Let's Encrypt production.</summary>
     public Uri DirectoryUri { get; set; } = AcmeDirectories.LetsEncrypt;
 
-    /// <summary>Which challenge types may be used to prove control of the domains.</summary>
-    public AcmeChallengeTypes Challenges { get; set; } = AcmeChallengeTypes.Http01 | AcmeChallengeTypes.TlsAlpn01;
+    /// <summary>
+    /// Which challenge types may be used to prove control of the domains. DNS-01 is only used when an
+    /// <see cref="IDnsChallengeProvider"/> is registered.
+    /// </summary>
+    public AcmeChallengeTypes Challenges { get; set; } = AcmeChallengeTypes.All;
+
+    /// <summary>
+    /// How long to wait after creating DNS-01 TXT records before asking the CA to check them, so they have
+    /// reached the authoritative name servers.
+    /// </summary>
+    public TimeSpan DnsPropagationDelay { get; set; } = TimeSpan.FromSeconds(30);
 
     /// <summary>The key type of the issued certificate.</summary>
     public CertificateKeyAlgorithm KeyAlgorithm { get; set; } = CertificateKeyAlgorithm.EcdsaP256;
@@ -68,6 +80,15 @@ public enum AcmeChallengeTypes
 
     /// <summary>The certificate authority connects on port 443 with the <c>acme-tls/1</c> protocol (RFC 8737).</summary>
     TlsAlpn01 = 2,
+
+    /// <summary>
+    /// The certificate authority looks up a TXT record under <c>_acme-challenge.</c>, created through an
+    /// <see cref="IDnsChallengeProvider"/>. The only type that can validate wildcard names.
+    /// </summary>
+    Dns01 = 4,
+
+    /// <summary>Every challenge type.</summary>
+    All = Http01 | TlsAlpn01 | Dns01,
 }
 
 /// <summary>Key type of the issued certificate.</summary>

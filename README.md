@@ -16,7 +16,7 @@ builder.Services.AddKestrelAcme(o =>
 });
 ```
 
-That's the whole setup. No certbot, no cron job, no reverse proxy.
+That's the whole setup. No certbot, no cron job, no reverse proxy. Wildcards work too, through DNS-01.
 
 ## Why
 
@@ -27,8 +27,9 @@ shrinking (47 days by 2029, 6-day certificates already available), so renewing b
 
 ## Features
 
-- **Both challenge types that work without DNS access:** TLS-ALPN-01 (port 443 only) and HTTP-01 (port 80).
-  It tries TLS-ALPN-01 first and falls back to HTTP-01, and skips a type Kestrel isn't listening for.
+- **All three challenge types:** TLS-ALPN-01 (port 443 only), HTTP-01 (port 80) and DNS-01 (through your DNS
+  host's API). It picks per domain, falls back from one to the next, and skips a type it can't answer.
+- **Wildcard certificates** (`*.example.com`) via DNS-01, in the same certificate as `example.com`.
 - **Renews when the CA says so** (ACME Renewal Information, RFC 9773), with the `replaces` field so renewals
   are exempt from Let's Encrypt rate limits. Without ARI: when a third of the lifetime is left.
 - **Zero-downtime swap.** New handshakes get the new certificate immediately. The full chain is sent.
@@ -95,13 +96,60 @@ aren't trusted by browsers, but its rate limits are much higher.
 | `AcceptTermsOfService` | `false` | Must be `true`. |
 | `Email` | none | For expiry notices from the CA. |
 | `DirectoryUri` | Let's Encrypt production | `AcmeDirectories.LetsEncryptStaging`, or another CA. |
-| `Challenges` | `Http01 \| TlsAlpn01` | Which challenge types may be used. |
+| `Challenges` | `All` | Which challenge types may be used. DNS-01 also needs an `IDnsChallengeProvider`. |
+| `DnsPropagationDelay` | 30 seconds | Wait between creating TXT records and asking the CA to check them. |
 | `KeyAlgorithm` | `EcdsaP256` | `EcdsaP384`, `Rsa2048`, `Rsa4096`. |
 | `Profile` | CA default | e.g. `"shortlived"` on Let's Encrypt. |
 | `RenewBefore` | ARI, else 1/3 of lifetime | Fixed margin, e.g. `TimeSpan.FromDays(30)`. |
 | `StoragePath` | `<LocalApplicationData>/KestrelAcme` | Where the account key and certificates live. |
 | `ExternalAccountBinding` | none | `new("key-id", "hmac-key")` for CAs that need it. |
 | `IssuanceTimeout` | 5 minutes | Per order. |
+
+### Wildcards and DNS-01
+
+DNS-01 proves control by publishing a TXT record, so it works for wildcard names and for servers that aren't
+reachable from the internet. Implement `IDnsChallengeProvider` (two methods) for your DNS host and register it:
+
+```csharp
+builder.Services.AddSingleton<IDnsChallengeProvider, CloudflareDns>();
+builder.Services.AddKestrelAcme(o =>
+{
+    o.Domains.Add("example.com");
+    o.Domains.Add("*.example.com");   // DNS-01; example.com itself can still use TLS-ALPN-01
+    o.AcceptTermsOfService = true;
+});
+```
+
+Here is a provider for Cloudflare, as an example (an API token with *Zone → DNS → Edit*):
+
+```csharp
+sealed class CloudflareDns(IHttpClientFactory http, IConfiguration config) : IDnsChallengeProvider
+{
+    private HttpClient Client()
+    {
+        var client = http.CreateClient();
+        client.BaseAddress = new($"https://api.cloudflare.com/client/v4/zones/{config["Cloudflare:ZoneId"]}/");
+        client.DefaultRequestHeaders.Authorization = new("Bearer", config["Cloudflare:Token"]);
+        return client;
+    }
+
+    public async Task AddTxtRecordAsync(string name, string value, CancellationToken ct) =>
+        (await Client().PostAsJsonAsync("dns_records", new { type = "TXT", name, content = value, ttl = 60 }, ct))
+            .EnsureSuccessStatusCode();
+
+    public async Task RemoveTxtRecordAsync(string name, string value, CancellationToken ct)
+    {
+        var client = Client();
+        var found = await client.GetFromJsonAsync<JsonElement>(
+            $"dns_records?type=TXT&name={Uri.EscapeDataString(name)}&content={Uri.EscapeDataString(value)}", ct);
+        foreach (var record in found.GetProperty("result").EnumerateArray())
+            (await client.DeleteAsync($"dns_records/{record.GetProperty("id").GetString()}", ct)).EnsureSuccessStatusCode();
+    }
+}
+```
+
+After creating the records, KestrelAcme waits `DnsPropagationDelay` (30 s by default) before asking the CA to
+check them.
 
 ### Storage
 
@@ -147,7 +195,6 @@ The health check reports *Degraded* while the placeholder is served or less than
 
 - **One instance per domain.** Several instances behind a load balancer would each order their own
   certificate, and a challenge may hit the wrong instance. Shared storage and locking are planned for 0.2.
-- **No wildcard certificates** yet: they need the DNS-01 challenge (planned, with a provider interface).
 - **No HTTP/3 yet.** Kestrel refuses the TLS hook KestrelAcme uses on HTTP/3 endpoints: an endpoint with
   `Protocols = Http1AndHttp2AndHttp3` fails to start with *"The OnAuthenticate callback is not supported with
   HTTP/3"*. HTTP/1.1 and HTTP/2 (Kestrel's default) are fine. HTTP/3 support is planned for 0.2.
@@ -177,8 +224,9 @@ eng/pebble.sh        # or eng/pebble.ps1 on Windows; needs Go. Builds Let's Encr
 dotnet test
 ```
 
-The integration tests start Pebble and a real Kestrel app, then check issuance through each challenge type,
-the chain sent to clients, reuse after restart, and renewal triggered by ARI. Pebble rejects 5% of nonces on
+The integration tests start Pebble and a real Kestrel app, then check issuance through each challenge type
+(DNS-01 through Pebble's test DNS server), a wildcard certificate, the chain sent to clients, reuse after
+restart, and renewal triggered by ARI. Pebble rejects 5% of nonces on
 purpose, so the retry path runs every time. Without Pebble those tests are skipped. CI runs everything on
 Linux, Windows and macOS, on .NET 8 and 10.
 

@@ -26,9 +26,11 @@ internal sealed class AcmeOptionsNormalizer : IPostConfigureOptions<AcmeOptions>
     internal static string Normalize(string domain)
     {
         var trimmed = domain.Trim();
+        var wildcard = trimmed.StartsWith("*.", StringComparison.Ordinal);
         try
         {
-            return Idn.GetAscii(trimmed).ToLowerInvariant();
+            var ascii = Idn.GetAscii(wildcard ? trimmed[2..] : trimmed).ToLowerInvariant();
+            return wildcard ? "*." + ascii : ascii;
         }
         catch (ArgumentException)
         {

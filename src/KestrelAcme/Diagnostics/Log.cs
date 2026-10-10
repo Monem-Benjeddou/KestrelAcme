@@ -51,4 +51,13 @@ internal static partial class Log
 
     [LoggerMessage(16, LogLevel.Error, "The issued certificate could not be saved; it is served anyway and saving is retried at the next check.")]
     public static partial void StoreWriteFailed(ILogger logger, Exception exception);
+
+    [LoggerMessage(17, LogLevel.Information, "Created DNS TXT record {Name}.")]
+    public static partial void DnsRecordAdded(ILogger logger, string name);
+
+    [LoggerMessage(18, LogLevel.Information, "Waiting {Delay} for the DNS records to propagate.")]
+    public static partial void WaitingForDns(ILogger logger, TimeSpan delay);
+
+    [LoggerMessage(19, LogLevel.Warning, "Could not remove a challenge response after the order.")]
+    public static partial void CleanupFailed(ILogger logger, Exception exception);
 }

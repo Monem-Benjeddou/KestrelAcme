@@ -23,7 +23,8 @@ internal sealed class TestApp : IAsyncDisposable
     public AcmeRenewalService Renewal => _app.Services.GetRequiredService<AcmeRenewalService>();
 
     public static async Task<TestApp> StartAsync(
-        PebbleFixture pebble, ITestOutputHelper output, string domain, string storagePath, Action<AcmeOptions>? configure = null)
+        PebbleFixture pebble, ITestOutputHelper output, string domain, string storagePath, Action<AcmeOptions>? configure = null,
+        Action<IServiceCollection>? services = null)
     {
         var builder = WebApplication.CreateBuilder(new WebApplicationOptions { ContentRootPath = AppContext.BaseDirectory });
         builder.Logging.ClearProviders().AddProvider(new TestOutputLoggerProvider(output)).SetMinimumLevel(LogLevel.Debug);
@@ -39,6 +40,7 @@ internal sealed class TestApp : IAsyncDisposable
             o.IssuanceTimeout = TimeSpan.FromSeconds(60);
             configure?.Invoke(o);
         });
+        services?.Invoke(builder.Services);
         builder.Services.AddHttpClient(AcmeServiceCollectionExtensions.HttpClientName)
             .ConfigurePrimaryHttpMessageHandler(pebble.CreateHandler);
 

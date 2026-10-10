@@ -27,9 +27,10 @@ certificate without a restart.
 
 | In | Out (later) |
 |---|---|
-| ACME client (RFC 8555), written from scratch, no third-party dependencies | DNS-01 and wildcard certificates (0.2, with a provider interface) |
+| ACME client (RFC 8555), written from scratch, no third-party dependencies | HTTP/3 endpoints (0.2) |
 | HTTP-01 challenge (port 80) | Shared storage and locking for several instances behind a load balancer (0.2) |
 | TLS-ALPN-01 challenge (RFC 8737, port 443 only) | Azure Key Vault and Redis stores (0.3) |
+| DNS-01 and wildcard certificates, through `IDnsChallengeProvider` | Ready-made DNS providers (Cloudflare, Route 53, Azure DNS) as separate packages |
 | ACME Renewal Information (ARI, RFC 9773) with fallback to "renew at 1/3 lifetime left" | IIS, HTTP.sys |
 | Certificate profiles (`shortlived` etc.) | |
 | External account binding (ZeroSSL, Google Trust Services) | |

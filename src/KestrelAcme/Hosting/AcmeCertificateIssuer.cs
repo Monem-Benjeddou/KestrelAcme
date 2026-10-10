@@ -15,12 +15,17 @@ internal sealed class AcmeCertificateIssuer(
     IAcmeStore store,
     ChallengeResponder challenges,
     IServer server,
+    IEnumerable<IDnsChallengeProvider> dnsProviders,
     IOptions<AcmeOptions> options,
     TimeProvider time,
     ILogger<AcmeCertificateIssuer> logger)
 {
     private static readonly TimeSpan DefaultPollInterval = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan MaxPollInterval = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan CleanupTimeout = TimeSpan.FromSeconds(30);
+
+    // The last registered provider wins, as usual for DI.
+    private readonly IDnsChallengeProvider? _dns = dnsProviders.LastOrDefault();
 
     private readonly SemaphoreSlim _clientLock = new(1, 1);
     private AcmeClient? _client;
@@ -36,7 +41,11 @@ internal sealed class AcmeCertificateIssuer(
     /// The store key of the certificate. It includes the CA directory, so switching from staging to production
     /// doesn't keep serving the staging certificate.
     /// </summary>
-    public string CertificateKey => $"certificates/{StoreName(Options.DirectoryUri)}/{Options.Domains[0].ToLowerInvariant()}.pfx";
+    public string CertificateKey => $"certificates/{StoreName(Options.DirectoryUri)}/{FileName(Options.Domains[0])}.pfx";
+
+    /// <summary>A domain as a file name: <c>*</c> isn't allowed in Windows file names.</summary>
+    internal static string FileName(string domain) =>
+        domain.StartsWith("*.", StringComparison.Ordinal) ? "_wildcard." + domain[2..] : domain;
 
     private string AccountKeyKey => $"accounts/{StoreName(Options.DirectoryUri)}/account.pem";
 
@@ -87,7 +96,8 @@ internal sealed class AcmeCertificateIssuer(
         var challengeTypes = GetChallengeTypes();
         if (challengeTypes.Count == 0)
             throw new AcmeException(
-                "No enabled challenge type can be answered: HTTP-01 needs an http:// endpoint and TLS-ALPN-01 an https:// endpoint.");
+                "No enabled challenge type can be answered: HTTP-01 needs an http:// endpoint, TLS-ALPN-01 an https:// "
+                + "endpoint and DNS-01 a registered IDnsChallengeProvider.");
 
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(Options.IssuanceTimeout);
@@ -97,29 +107,31 @@ internal sealed class AcmeCertificateIssuer(
             var client = await GetClientAsync(timeout.Token).ConfigureAwait(false);
             AcmeException? lastError = null;
 
+            // Attempt i prefers challengeTypes[i]; each authorization uses the first preferred type it offers,
+            // so a wildcard name can use DNS-01 while the plain name in the same order uses TLS-ALPN-01.
             for (var i = 0; i < challengeTypes.Count; i++)
             {
-                var challengeType = challengeTypes[i];
+                var preference = challengeTypes.Skip(i).Concat(challengeTypes.Take(i)).ToList();
                 try
                 {
-                    var issued = await IssueWithAsync(client, challengeType, replaces, timeout.Token).ConfigureAwait(false);
-                    _lastSucceeded = challengeType;
-                    if (_lastFailed == challengeType)
+                    var issued = await IssueWithAsync(client, preference, replaces, timeout.Token).ConfigureAwait(false);
+                    _lastSucceeded = preference[0];
+                    if (_lastFailed == preference[0])
                         _lastFailed = null;
                     return issued;
                 }
                 catch (AcmeException e) when (e.ProblemType == AcmeProblem.AlreadyReplaced && replaces is not null)
                 {
                     // The CA won't accept "replaces" for this certificate (already renewed elsewhere, say).
-                    // It's only a hint: retry the same challenge type without it.
-                    Log.OrderFailed(logger, challengeType, e.Message);
+                    // It's only a hint: retry the same preference without it.
+                    Log.OrderFailed(logger, preference[0], e.Message);
                     replaces = null;
                     i--;
                 }
                 catch (AcmeException e) when (e.ProblemType is not (AcmeProblem.RateLimited or AcmeProblem.Unauthorized or AcmeProblem.AccountDoesNotExist))
                 {
-                    Log.OrderFailed(logger, challengeType, e.Message);
-                    _lastFailed = challengeType;
+                    Log.OrderFailed(logger, preference[0], e.Message);
+                    _lastFailed = preference[0];
                     lastError = e;
                 }
             }
@@ -139,23 +151,44 @@ internal sealed class AcmeCertificateIssuer(
     }
 
     private async Task<CertificateBundle> IssueWithAsync(
-        AcmeClient client, string challengeType, string? replaces, CancellationToken cancellationToken)
+        AcmeClient client, IReadOnlyList<string> preference, string? replaces, CancellationToken cancellationToken)
     {
-        Log.Ordering(logger, string.Join(", ", Options.Domains), challengeType);
+        Log.Ordering(logger, string.Join(", ", Options.Domains), preference[0]);
 
         var order = await client.NewOrderAsync(Options.Domains, Options.Profile, replaces, cancellationToken).ConfigureAwait(false);
         var orderUrl = order.Location ?? throw new AcmeException("The certificate authority did not return an order URL.");
 
-        var cleanup = new List<Action>();
+        var cleanup = new List<Func<Task>>();
         try
         {
+            // 1. Put every challenge response in place.
+            var pending = new List<PendingChallenge>();
             foreach (var authorizationUrl in order.Value.Authorizations)
-                await AuthorizeAsync(client, authorizationUrl, challengeType, cleanup, cancellationToken).ConfigureAwait(false);
+            {
+                var authorization = (await client.GetAuthorizationAsync(authorizationUrl, cancellationToken).ConfigureAwait(false)).Value;
+                if (authorization.Status == AcmeStatus.Valid)
+                    continue; // Validated recently; the CA reuses it.
+
+                var challenge = await PrepareAsync(client, authorization, preference, cleanup, cancellationToken).ConfigureAwait(false);
+                pending.Add(new PendingChallenge(authorizationUrl, authorization.Identifier.Value, challenge));
+            }
+
+            // 2. Give new DNS records time to reach the authoritative servers.
+            if (pending.Any(p => p.Challenge.Type == AcmeChallenge.Dns01) && Options.DnsPropagationDelay > TimeSpan.Zero)
+            {
+                Log.WaitingForDns(logger, Options.DnsPropagationDelay);
+                await Task.Delay(Options.DnsPropagationDelay, time, cancellationToken).ConfigureAwait(false);
+            }
+
+            // 3. Ask for validation of all of them, then wait: the CA checks them in parallel.
+            foreach (var p in pending)
+                await client.AnswerChallengeAsync(p.Challenge.Url, cancellationToken).ConfigureAwait(false);
+            foreach (var p in pending)
+                await WaitForValidationAsync(client, p, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
-            foreach (var remove in cleanup)
-                remove();
+            await CleanUpAsync(cleanup).ConfigureAwait(false);
         }
 
         var current = await PollOrderAsync(client, orderUrl, AcmeStatus.Ready, cancellationToken).ConfigureAwait(false);
@@ -173,59 +206,106 @@ internal sealed class AcmeCertificateIssuer(
         }
     }
 
-    private async Task AuthorizeAsync(
-        AcmeClient client, Uri url, string challengeType, List<Action> cleanup, CancellationToken cancellationToken)
-    {
-        var authorization = (await client.GetAuthorizationAsync(url, cancellationToken).ConfigureAwait(false)).Value;
-        if (authorization.Status == AcmeStatus.Valid)
-            return; // Validated recently; the CA reuses it.
+    private sealed record PendingChallenge(Uri AuthorizationUrl, string Domain, AcmeChallenge Challenge);
 
+    /// <summary>Picks the challenge for one authorization and serves (or publishes) its response.</summary>
+    private async Task<AcmeChallenge> PrepareAsync(
+        AcmeClient client, AcmeAuthorization authorization, IReadOnlyList<string> preference, List<Func<Task>> cleanup,
+        CancellationToken cancellationToken)
+    {
+        // For "*.example.com" the identifier is "example.com" with wildcard: true (RFC 8555 §7.1.4).
         var domain = authorization.Identifier.Value;
-        var challenge = authorization.Challenges.FirstOrDefault(c => c.Type == challengeType)
-            ?? throw new AcmeException($"The certificate authority offered no {challengeType} challenge for {domain}.");
+        var shown = authorization.Wildcard ? "*." + domain : domain;
+
+        var challenge = preference
+            .Select(type => authorization.Challenges.FirstOrDefault(c => c.Type == type))
+            .FirstOrDefault(c => c is not null)
+            ?? throw new AcmeException(
+                $"None of the usable challenge types ({string.Join(", ", preference)}) was offered for {shown}. Offered: "
+                + string.Join(", ", authorization.Challenges.Select(c => c.Type)) + ".");
         if (challenge.Token is null)
-            throw new AcmeException($"The {challengeType} challenge for {domain} has no token.");
+            throw new AcmeException($"The {challenge.Type} challenge for {shown} has no token.");
 
         var keyAuthorization = client.Key.KeyAuthorization(challenge.Token);
-        switch (challengeType)
+        switch (challenge.Type)
         {
             case AcmeChallenge.Http01:
                 challenges.AddHttp01(challenge.Token, keyAuthorization);
-                cleanup.Add(() => challenges.RemoveHttp01(challenge.Token));
+                cleanup.Add(() =>
+                {
+                    challenges.RemoveHttp01(challenge.Token);
+                    return Task.CompletedTask;
+                });
                 break;
+
             case AcmeChallenge.TlsAlpn01:
                 challenges.AddTlsAlpn01(domain, CertificateFactory.CreateTlsAlpnChallenge(domain, keyAuthorization, time.GetUtcNow()));
                 cleanup.Add(() =>
                 {
                     if (challenges.RemoveTlsAlpn01(domain, out var certificate))
                         certificate.Retire(time);
+                    return Task.CompletedTask;
                 });
+                break;
+
+            case AcmeChallenge.Dns01:
+                var name = Dns01RecordName(domain);
+                var value = Dns01RecordValue(keyAuthorization);
+                await _dns!.AddTxtRecordAsync(name, value, cancellationToken).ConfigureAwait(false);
+                Log.DnsRecordAdded(logger, name);
+                cleanup.Add(() => _dns.RemoveTxtRecordAsync(name, value, CancellationToken.None));
                 break;
         }
 
-        await client.AnswerChallengeAsync(challenge.Url, cancellationToken).ConfigureAwait(false);
+        return challenge;
+    }
 
+    private async Task WaitForValidationAsync(AcmeClient client, PendingChallenge pending, CancellationToken cancellationToken)
+    {
         while (true)
         {
-            var response = await client.GetAuthorizationAsync(url, cancellationToken).ConfigureAwait(false);
-            authorization = response.Value;
+            var response = await client.GetAuthorizationAsync(pending.AuthorizationUrl, cancellationToken).ConfigureAwait(false);
+            var authorization = response.Value;
 
             switch (authorization.Status)
             {
                 case AcmeStatus.Valid:
-                    Log.AuthorizationValid(logger, domain, challengeType);
+                    Log.AuthorizationValid(logger, pending.Domain, pending.Challenge.Type);
                     return;
                 case AcmeStatus.Pending:
                     await DelayAsync(response.RetryAfter, cancellationToken).ConfigureAwait(false);
                     break;
                 default:
-                    var problem = authorization.Challenges.FirstOrDefault(c => c.Type == challengeType)?.Error;
+                    var problem = authorization.Challenges.FirstOrDefault(c => c.Type == pending.Challenge.Type)?.Error;
                     throw new AcmeException(
-                        $"Validation of {domain} with {challengeType} failed: {problem?.ToString() ?? authorization.Status}",
+                        $"Validation of {pending.Domain} with {pending.Challenge.Type} failed: {problem?.ToString() ?? authorization.Status}",
                         problem?.Type);
             }
         }
     }
+
+    /// <summary>Removes challenge responses. Failures are logged, not thrown: the order's outcome matters more.</summary>
+    private async Task CleanUpAsync(List<Func<Task>> cleanup)
+    {
+        foreach (var remove in cleanup)
+        {
+            try
+            {
+                await remove().WaitAsync(CleanupTimeout, time).ConfigureAwait(false);
+            }
+            catch (Exception e)
+            {
+                Log.CleanupFailed(logger, e);
+            }
+        }
+    }
+
+    /// <summary>The TXT record name for a DNS-01 challenge (RFC 8555 §8.4).</summary>
+    internal static string Dns01RecordName(string domain) => "_acme-challenge." + domain;
+
+    /// <summary>The TXT record value: base64url of the SHA-256 of the key authorization (RFC 8555 §8.4).</summary>
+    internal static string Dns01RecordValue(string keyAuthorization) =>
+        Base64Url.Encode(System.Security.Cryptography.SHA256.HashData(Encoding.ASCII.GetBytes(keyAuthorization)));
 
     private async Task<AcmeOrder> PollOrderAsync(AcmeClient client, Uri orderUrl, string target, CancellationToken cancellationToken)
     {
@@ -257,7 +337,8 @@ internal sealed class AcmeCertificateIssuer(
 
     /// <summary>
     /// The challenge types to try, in order. TLS-ALPN-01 comes first by default because it only needs the HTTPS
-    /// port, which the app is serving anyway; HTTP-01 is the fallback. A type is skipped if Kestrel isn't listening for it.
+    /// port, which the app is serving anyway; then HTTP-01; then DNS-01, which is slower because of propagation.
+    /// A type is skipped if Kestrel isn't listening for it, or, for DNS-01, if no provider is registered.
     /// </summary>
     internal List<string> GetChallengeTypes()
     {
@@ -265,11 +346,13 @@ internal sealed class AcmeCertificateIssuer(
         var hasHttps = addresses.Count == 0 || addresses.Any(a => a.StartsWith("https://", StringComparison.OrdinalIgnoreCase));
         var hasHttp = addresses.Count == 0 || addresses.Any(a => a.StartsWith("http://", StringComparison.OrdinalIgnoreCase));
 
-        var types = new List<string>(2);
+        var types = new List<string>(3);
         if (Options.Challenges.HasFlag(AcmeChallengeTypes.TlsAlpn01) && hasHttps)
             types.Add(AcmeChallenge.TlsAlpn01);
         if (Options.Challenges.HasFlag(AcmeChallengeTypes.Http01) && hasHttp)
             types.Add(AcmeChallenge.Http01);
+        if (Options.Challenges.HasFlag(AcmeChallengeTypes.Dns01) && _dns is not null)
+            types.Add(AcmeChallenge.Dns01); // Last: it waits for DNS propagation. Wildcards use it regardless.
 
         // What worked last time first, what failed last time last.
         return types

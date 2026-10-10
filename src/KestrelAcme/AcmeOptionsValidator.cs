@@ -2,10 +2,16 @@ using Microsoft.Extensions.Options;
 
 namespace KestrelAcme;
 
-internal sealed class AcmeOptionsValidator : IValidateOptions<AcmeOptions>
+internal sealed class AcmeOptionsValidator(IEnumerable<IDnsChallengeProvider> dnsProviders) : IValidateOptions<AcmeOptions>
 {
+    public AcmeOptionsValidator()
+        : this([])
+    {
+    }
+
     public ValidateOptionsResult Validate(string? name, AcmeOptions options)
     {
+        var canUseDns = options.Challenges.HasFlag(AcmeChallengeTypes.Dns01) && dnsProviders.Any();
         var errors = new List<string>();
 
         if (options.Domains.Count == 0)
@@ -15,8 +21,9 @@ internal sealed class AcmeOptionsValidator : IValidateOptions<AcmeOptions>
         {
             if (!IsValidDomain(domain))
                 errors.Add($"'{domain}' is not a valid domain name.");
-            else if (domain.StartsWith("*.", StringComparison.Ordinal))
-                errors.Add($"'{domain}': wildcard certificates need the DNS-01 challenge, which isn't supported yet.");
+            else if (domain.StartsWith("*.", StringComparison.Ordinal) && !canUseDns)
+                errors.Add($"'{domain}': wildcard names can only be validated with DNS-01. Register an IDnsChallengeProvider "
+                    + "and keep AcmeChallengeTypes.Dns01 enabled.");
         }
 
         if (!options.AcceptTermsOfService)
@@ -33,6 +40,9 @@ internal sealed class AcmeOptionsValidator : IValidateOptions<AcmeOptions>
 
         if (options.RenewBefore is { } renewBefore && renewBefore <= TimeSpan.Zero)
             errors.Add("AcmeOptions.RenewBefore must be positive.");
+
+        if (options.DnsPropagationDelay < TimeSpan.Zero)
+            errors.Add("AcmeOptions.DnsPropagationDelay can't be negative.");
 
         if (options.IssuanceTimeout <= TimeSpan.Zero)
             errors.Add("AcmeOptions.IssuanceTimeout must be positive.");

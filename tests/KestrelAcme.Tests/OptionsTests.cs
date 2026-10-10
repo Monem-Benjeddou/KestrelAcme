@@ -24,12 +24,30 @@ public class OptionsTests
     [InlineData("not a domain")]
     [InlineData("example.com.")]
     [InlineData("1.2.3.4")]
-    [InlineData("*.example.com")]
+    [InlineData("*.example.com")] // no DNS provider registered
     public void Rejects_unusable_domains(string domain)
     {
         var options = Valid();
         options.Domains[0] = domain;
         Assert.True(new AcmeOptionsValidator().Validate(null, options).Failed);
+    }
+
+    [Fact]
+    public void Wildcards_are_accepted_once_a_dns_provider_is_registered()
+    {
+        var options = Valid();
+        options.Domains.Add("*.example.com");
+
+        Assert.True(new AcmeOptionsValidator([new NoDns()]).Validate(null, options).Succeeded);
+
+        options.Challenges = AcmeChallengeTypes.Http01 | AcmeChallengeTypes.TlsAlpn01;
+        Assert.True(new AcmeOptionsValidator([new NoDns()]).Validate(null, options).Failed);
+    }
+
+    private sealed class NoDns : IDnsChallengeProvider
+    {
+        public Task AddTxtRecordAsync(string name, string value, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task RemoveTxtRecordAsync(string name, string value, CancellationToken cancellationToken) => Task.CompletedTask;
     }
 
     [Fact]
@@ -70,17 +88,20 @@ public class OptionsTests
     [Fact]
     public void Domains_are_lower_cased_converted_to_punycode_and_deduplicated()
     {
-        var services = new ServiceCollection().AddKestrelAcme(o =>
+        var services = new ServiceCollection()
+            .AddSingleton<IDnsChallengeProvider, NoDns>()
+            .AddKestrelAcme(o =>
         {
             o.AcceptTermsOfService = true;
             o.Domains.Add(" Example.COM ");
             o.Domains.Add("example.com");
             o.Domains.Add("bücher.example");
+            o.Domains.Add("*.Bücher.example");
         });
 
         var options = services.BuildServiceProvider().GetRequiredService<IOptions<AcmeOptions>>().Value;
 
-        Assert.Equal(["example.com", "xn--bcher-kva.example"], options.Domains);
+        Assert.Equal(["example.com", "xn--bcher-kva.example", "*.xn--bcher-kva.example"], options.Domains);
     }
 
     [Fact]

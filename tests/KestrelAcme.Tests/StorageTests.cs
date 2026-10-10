@@ -88,6 +88,24 @@ public sealed class StorageTests : IDisposable
         Assert.Equal(expected, AcmeCertificateIssuer.StoreName(new Uri(directory)));
     }
 
+    [Theory]
+    [InlineData("example.com", "example.com")]
+    [InlineData("*.example.com", "_wildcard.example.com")] // '*' is not allowed in Windows file names
+    public void Certificate_file_names_are_valid_on_every_os(string domain, string expected)
+    {
+        Assert.Equal(expected, AcmeCertificateIssuer.FileName(domain));
+    }
+
+    [Fact]
+    public void Dns01_record_is_the_hashed_key_authorization_under_acme_challenge()
+    {
+        var expected = Protocol.Base64Url.Encode(System.Security.Cryptography.SHA256.HashData("token.thumb"u8));
+
+        Assert.Equal("_acme-challenge.example.com", AcmeCertificateIssuer.Dns01RecordName("example.com"));
+        Assert.Equal(expected, AcmeCertificateIssuer.Dns01RecordValue("token.thumb"));
+        Assert.Equal(43, expected.Length); // 32 bytes, unpadded base64url
+    }
+
     public void Dispose()
     {
         try

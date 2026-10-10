@@ -63,6 +63,7 @@ internal sealed class AcmeChallenge
 {
     public const string Http01 = "http-01";
     public const string TlsAlpn01 = "tls-alpn-01";
+    public const string Dns01 = "dns-01";
 
     public required string Type { get; init; }
     public required Uri Url { get; init; }
