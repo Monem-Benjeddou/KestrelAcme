@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.1]
 
 Fixes from a review of the multi-instance support, all with tests:
 

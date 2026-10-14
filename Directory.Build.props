@@ -7,7 +7,7 @@
     <Deterministic>true</Deterministic>
     <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
 
-    <Version>0.2.0</Version>
+    <Version>0.2.1</Version>
     <Authors>KestrelAcme contributors</Authors>
     <Copyright>Copyright (c) KestrelAcme contributors</Copyright>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
