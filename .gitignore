@@ -2,6 +2,7 @@ bin/
 obj/
 artifacts/
 .pebble/
+.kind/
 .vs/
 .idea/
 *.user

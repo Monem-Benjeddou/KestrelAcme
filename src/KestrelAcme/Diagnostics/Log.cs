@@ -60,4 +60,22 @@ internal static partial class Log
 
     [LoggerMessage(19, LogLevel.Warning, "Could not remove a challenge response after the order.")]
     public static partial void CleanupFailed(ILogger logger, Exception exception);
+
+    [LoggerMessage(20, LogLevel.Debug, "Another instance is ordering the certificate; looking again in {Wait}.")]
+    public static partial void RenewalLocked(ILogger logger, TimeSpan wait);
+
+    [LoggerMessage(21, LogLevel.Warning, "Could not release the renewal lock.")]
+    public static partial void LockReleaseFailed(ILogger logger, Exception exception);
+
+    [LoggerMessage(22, LogLevel.Warning, "Could not share a challenge answer through the store; other instances can't answer it.")]
+    public static partial void ChallengeShareFailed(ILogger logger, Exception exception);
+
+    [LoggerMessage(23, LogLevel.Debug, "Could not read the shared challenge answer {Key}.")]
+    public static partial void ChallengeLookupFailed(ILogger logger, string key, Exception exception);
+
+    [LoggerMessage(24, LogLevel.Warning, "Lost the Kubernetes lease {Path}; another replica may take over, so any order in progress is abandoned.")]
+    public static partial void LeaseLost(ILogger logger, string path);
+
+    [LoggerMessage(25, LogLevel.Warning, "Could not renew the Kubernetes lease {Path}; trying again.")]
+    public static partial void LeaseRenewalFailed(ILogger logger, string path, Exception exception);
 }

@@ -1,3 +1,4 @@
+using KestrelAcme.Certificates;
 using Microsoft.AspNetCore.Connections;
 using Microsoft.Extensions.Logging;
 
@@ -7,14 +8,28 @@ namespace KestrelAcme.Hosting;
 /// Kestrel connection middleware that runs before TLS: it looks at the ClientHello without consuming it and
 /// stores the result as a connection feature, for <see cref="KestrelOptionsSetup"/> to pick the certificate.
 /// </summary>
-internal sealed class ClientHelloMiddleware(ConnectionDelegate next, ILogger logger)
+internal sealed class ClientHelloMiddleware(ConnectionDelegate next, ChallengeResponder challenges, ILogger logger)
 {
     private static readonly TimeSpan PeekTimeout = TimeSpan.FromSeconds(5);
 
     public async Task InvokeAsync(ConnectionContext connection)
     {
-        if (await PeekAsync(connection).ConfigureAwait(false) is { } clientHello)
-            connection.Features.Set(clientHello);
+        if (await PeekAsync(connection).ConfigureAwait(false) is not { } clientHello)
+        {
+            await next(connection).ConfigureAwait(false);
+            return;
+        }
+
+        connection.Features.Set(clientHello);
+
+        // A TLS-ALPN-01 validation for another instance's order. OnAuthenticate can't wait for the store, so the
+        // challenge certificate is loaded here, for this connection only.
+        using var shared = clientHello.Offers(ChallengeResponder.AcmeTlsProtocol) && clientHello.ServerName is { } name
+            && !challenges.TryGetTlsAlpn01(name, out _)
+            ? await challenges.LoadSharedTlsAlpn01Async(name, connection.ConnectionClosed).ConfigureAwait(false)
+            : null;
+        if (shared is not null)
+            connection.Features.Set(new SharedTlsAlpn01Challenge(shared));
 
         await next(connection).ConfigureAwait(false);
     }
@@ -59,3 +74,6 @@ internal sealed class ClientHelloMiddleware(ConnectionDelegate next, ILogger log
         }
     }
 }
+
+/// <summary>The TLS-ALPN-01 certificate for a connection validating another instance's order.</summary>
+internal sealed record SharedTlsAlpn01Challenge(CertificateBundle Certificate);

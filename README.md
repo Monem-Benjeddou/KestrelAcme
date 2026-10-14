@@ -35,6 +35,9 @@ shrinking (47 days by 2029, 6-day certificates already available), so renewing b
 - **Zero-downtime swap.** New handshakes get the new certificate immediately. The full chain is sent.
 - **Starts fast.** The stored certificate is loaded before Kestrel accepts its first connection.
 - **Never breaks a handshake.** A self-signed placeholder is served until the first certificate arrives.
+- **Several instances, one certificate.** Replicas behind a load balancer take turns through a lock: one orders,
+  the others pick up the certificate it stores, and any of them answers the CA's challenges. Works on a shared
+  volume with no setup, and in Kubernetes through Secrets and a Lease, without a client library.
 - **Plays well with others.** Endpoints that configure their own certificate are left alone. HTTP-01 answers
   run before your middleware, so `UseHttpsRedirection` or authentication can't block them.
 - **Production details:** remembers which challenge type works so failed validations don't eat rate limits,
@@ -159,11 +162,54 @@ on Linux and macOS, and on Windows an ACL limited to the current user, SYSTEM an
 limits. Accounts without a home folder (systemd `DynamicUser`, containers without `HOME`) must set `StoragePath`.
 
 To keep them elsewhere (Key Vault, a database, blob storage), implement `IAcmeStore`: two methods, read and write
-bytes by key. Register it before `AddKestrelAcme`:
+bytes by key, and optionally `DeleteAsync` to clean up challenge answers. Register it before `AddKestrelAcme`:
 
 ```csharp
 builder.Services.AddSingleton<IAcmeStore, MyKeyVaultStore>();
 ```
+
+### Several instances
+
+Replicas of an app behind a load balancer share one certificate. When it's due, one replica takes a lock and
+orders it; the others wait, then load it from the store, without a restart. The lock is held until the order
+succeeds, retries included, so the replicas don't multiply failed attempts against the CA's rate limits. Challenge
+answers go through the store too, so whichever replica the CA reaches can answer.
+
+**On a shared volume** (NFSv4, SMB/Azure Files, EFS), point every replica's `StoragePath` at it. Nothing else to
+configure: the lock is a file lock, released at once if the replica's process crashes, and by the file server
+(about 90 s on NFSv4) if its whole node is lost. Don't set `DOTNET_SYSTEM_IO_DISABLEFILELOCKING`, which turns
+file locks off.
+
+**In Kubernetes**, without a shared volume, keep the state in the API server:
+
+```csharp
+builder.Services.AddKestrelAcme(builder.Configuration.GetSection("Acme"));
+builder.Services.AddKestrelAcmeKubernetes(); // Secrets for storage, a Lease for the lock
+```
+
+Each value is a Secret of its own, named `kestrelacme-store-…`, and the lock is a Lease, renewed every 20 s while
+held. A replica that can't renew it for 40 s (cut off from the API server) abandons its order; the others take
+over only after 60 s without a renewal, so two replicas never order at once. It calls the API server directly with the pod's service
+account, which needs this Role (and a RoleBinding to it):
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: kestrelacme }
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, create, update, delete]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, create, update]
+```
+
+Set `o.Name` to keep two apps in one namespace apart. TLS still has to reach the pods: expose them through a
+`LoadBalancer` Service or a TCP (passthrough) ingress, not one that terminates TLS.
+
+**With a custom `IAcmeStore`**, also register an `IAcmeLock` backed by the same system (a database lock, a blob
+lease); without one, replicas don't coordinate.
 
 ### Proxies and custom HTTP settings
 
@@ -191,13 +237,11 @@ builder.Services.AddOpenTelemetry()
 The health check reports *Degraded* while the placeholder is served or less than 7 days are left, and
 *Unhealthy* once the certificate has expired.
 
-## Limitations (0.1)
+## Limitations
 
-- **One instance per domain.** Several instances behind a load balancer would each order their own
-  certificate, and a challenge may hit the wrong instance. Shared storage and locking are planned for 0.2.
 - **No HTTP/3 yet.** Kestrel refuses the TLS hook KestrelAcme uses on HTTP/3 endpoints: an endpoint with
   `Protocols = Http1AndHttp2AndHttp3` fails to start with *"The OnAuthenticate callback is not supported with
-  HTTP/3"*. HTTP/1.1 and HTTP/2 (Kestrel's default) are fine. HTTP/3 support is planned for 0.2.
+  HTTP/3"*. HTTP/1.1 and HTTP/2 (Kestrel's default) are fine. HTTP/3 support is planned.
 - Kestrel only: not IIS or HTTP.sys.
 - On Linux, ports below 1024 need root or `CAP_NET_BIND_SERVICE`
   (`sudo setcap 'cap_net_bind_service=+ep' /path/to/app`).
@@ -214,6 +258,8 @@ TCP ─▶ ClientHello peek ─▶ TLS (OnAuthenticate) ─▶ HTTP-01 middlewar
   doesn't expose the client's ALPN list, which TLS-ALPN-01 needs.
 - `OnAuthenticate` hands `SslStream` a certificate context (leaf + intermediates) or, for an `acme-tls/1`
   validation, the challenge certificate.
+- Replicas coordinate through `IAcmeLock`: the holder orders, and every replica reads the store before ordering
+  and again after taking the lock, so a certificate another replica just stored is used instead of ordered again.
 - A background service orders, renews and stores certificates. The ACME client (RFC 8555, JWS/ES256) is written
   from scratch in a few hundred lines, so there is no dependency to go stale.
 
@@ -224,9 +270,13 @@ eng/pebble.sh        # or eng/pebble.ps1 on Windows; needs Go. Builds Let's Encr
 dotnet test
 ```
 
+The Kubernetes tests need a cluster: `eng/kind.sh` creates a local one with kind (its own kubeconfig, your
+kubectl context is untouched) and prints the `KESTRELACME_KUBERNETES` variable to set. Without it they're skipped.
+
 The integration tests start Pebble and a real Kestrel app, then check issuance through each challenge type
 (DNS-01 through Pebble's test DNS server), a wildcard certificate, the chain sent to clients, reuse after
-restart, and renewal triggered by ARI. Pebble rejects 5% of nonces on
+restart, renewal triggered by ARI, and replicas sharing a store: one order between them, challenges answered by
+the replica the CA reaches, and no retries by the others while the lock holder backs off. Pebble rejects 5% of nonces on
 purpose, so the retry path runs every time. Without Pebble those tests are skipped. CI runs everything on
 Linux, Windows and macOS, on .NET 8 and 10.
 

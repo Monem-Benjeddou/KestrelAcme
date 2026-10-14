@@ -24,11 +24,11 @@ internal sealed class TestApp : IAsyncDisposable
 
     public static async Task<TestApp> StartAsync(
         PebbleFixture pebble, ITestOutputHelper output, string domain, string storagePath, Action<AcmeOptions>? configure = null,
-        Action<IServiceCollection>? services = null)
+        Action<IServiceCollection>? services = null, int httpPort = PebbleFixture.HttpPort, int tlsPort = PebbleFixture.TlsPort)
     {
         var builder = WebApplication.CreateBuilder(new WebApplicationOptions { ContentRootPath = AppContext.BaseDirectory });
         builder.Logging.ClearProviders().AddProvider(new TestOutputLoggerProvider(output)).SetMinimumLevel(LogLevel.Debug);
-        builder.WebHost.UseUrls($"http://127.0.0.1:{PebbleFixture.HttpPort}", $"https://127.0.0.1:{PebbleFixture.TlsPort}");
+        builder.WebHost.UseUrls($"http://127.0.0.1:{httpPort}", $"https://127.0.0.1:{tlsPort}");
 
         builder.Services.AddKestrelAcme(o =>
         {
