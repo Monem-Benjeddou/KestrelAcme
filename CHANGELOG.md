@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.2]
 
 Fixes from a security review. Nothing let an anonymous client obtain a certificate or read keys; these close
 resource-exhaustion and hostile-CA paths:
