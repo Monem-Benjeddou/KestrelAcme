@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+- Several instances behind a load balancer share one certificate. One orders it under a lock (`IAcmeLock`), held
+  until the order succeeds so the others don't multiply retries; the others pick it up from the store without a
+  restart. Challenge answers are shared through the store, so any instance can answer the CA.
+- The default lock is a file lock next to the certificate: replicas sharing `StoragePath` on a volume coordinate
+  with no configuration.
+- `AddKestrelAcmeKubernetes()`: storage in Secrets and a Lease for the lock, calling the API server directly
+  (no client library).
+- `IAcmeStore.DeleteAsync`, with a default implementation, so existing stores keep compiling.
+
 ## [0.1.0]
 
 First release.

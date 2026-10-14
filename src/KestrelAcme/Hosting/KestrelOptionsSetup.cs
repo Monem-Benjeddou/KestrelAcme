@@ -24,7 +24,7 @@ internal sealed class KestrelOptionsSetup(
     public void Configure(KestrelServerOptions options)
     {
         options.ConfigureEndpointDefaults(listen =>
-            listen.Use(next => new ClientHelloMiddleware(next, logger).InvokeAsync));
+            listen.Use(next => new ClientHelloMiddleware(next, challenges, logger).InvokeAsync));
 
         options.ConfigureHttpsDefaults(https =>
         {
@@ -38,10 +38,13 @@ internal sealed class KestrelOptionsSetup(
         var clientHello = connection.Features.Get<ClientHello>();
 
         // RFC 8737: a validation connection offers only acme-tls/1 and must get the challenge certificate.
-        if (clientHello?.Offers(ChallengeResponder.AcmeTlsProtocol) == true
-            && challenges.TryGetTlsAlpn01(clientHello.ServerName, out var challenge))
+        // This instance's own order first, then one another instance shared (loaded by ClientHelloMiddleware).
+        var challenge = clientHello?.Offers(ChallengeResponder.AcmeTlsProtocol) != true ? null
+            : challenges.TryGetTlsAlpn01(clientHello.ServerName, out var own) ? own
+            : connection.Features.Get<SharedTlsAlpn01Challenge>()?.Certificate;
+        if (challenge is not null)
         {
-            Log.TlsAlpnChallengeServed(logger, clientHello.ServerName!);
+            Log.TlsAlpnChallengeServed(logger, clientHello!.ServerName!);
             UseCertificate(ssl, challenge.Context);
             ssl.ApplicationProtocols = AcmeTlsOnly;
             return;

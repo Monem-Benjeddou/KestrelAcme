@@ -12,9 +12,14 @@ namespace KestrelAcme.Hosting;
 /// Loads the stored certificate before Kestrel starts, then keeps it valid: issues one if there is none,
 /// and renews it when the CA's renewal window (or the configured margin) is reached.
 /// </summary>
+/// <remarks>
+/// Instances sharing a store take turns through <see cref="IAcmeLock"/>: one orders, the others wait and pick up
+/// the certificate it stores.
+/// </remarks>
 internal sealed class AcmeRenewalService(
     AcmeCertificateIssuer issuer,
     IAcmeStore store,
+    IAcmeLock renewalLock,
     CertificateSelector selector,
     AcmeMetrics metrics,
     IHostApplicationLifetime lifetime,
@@ -24,6 +29,9 @@ internal sealed class AcmeRenewalService(
 {
     private static readonly TimeSpan SaveTimeout = TimeSpan.FromSeconds(30);
 
+    /// <summary>How soon an instance that found the lock taken looks again, for the certificate or the lock.</summary>
+    internal static readonly TimeSpan LockedRetry = TimeSpan.FromSeconds(30);
+
     private readonly SemaphoreSlim _wake = new(0, 1);
 
     // Picked once per certificate, so the moment inside the CA's window doesn't move every time we look.
@@ -31,6 +39,10 @@ internal sealed class AcmeRenewalService(
 
     // An issued certificate the store failed to save; saving is retried on every check.
     private CertificateBundle? _unsaved;
+
+    // Taken when an order is due and kept until one succeeds, through retries: other instances must neither order
+    // the same certificate nor multiply failed attempts (and the CA's rate limits) while this one backs off.
+    private IAsyncDisposable? _lock;
 
     private AcmeOptions Options => options.Value;
 
@@ -48,32 +60,49 @@ internal sealed class AcmeRenewalService(
     }
 
     /// <summary>Runs before any hosted service starts (Kestrel included), so the first handshake gets the stored certificate.</summary>
-    public async Task StartingAsync(CancellationToken cancellationToken)
+    public Task StartingAsync(CancellationToken cancellationToken) => LoadStoredAsync(startup: true, cancellationToken);
+
+    /// <summary>
+    /// Serves the stored certificate if it is newer than the one being served: at startup, and after another
+    /// instance renewed. Returns whether it did.
+    /// </summary>
+    private async Task<bool> LoadStoredAsync(bool startup, CancellationToken cancellationToken)
     {
+        CertificateBundle certificate;
         try
         {
             var pfx = await store.ReadAsync(issuer.CertificateKey, cancellationToken).ConfigureAwait(false);
             if (pfx is null)
             {
-                Log.NoStoredCertificate(logger);
-                return;
+                if (startup)
+                    Log.NoStoredCertificate(logger);
+                return false;
             }
-
-            var certificate = CertificateFactory.FromPfx(pfx);
-            if (!certificate.Covers(Options.Domains))
-                Log.StoredCertificateIgnored(logger, "it covers other domains");
-            else if (certificate.NotAfter <= time.GetUtcNow())
-                Log.StoredCertificateIgnored(logger, "it has expired");
-            else
-            {
-                selector.Use(certificate);
-                Log.LoadedCertificate(logger, string.Join(", ", certificate.DnsNames), certificate.NotAfter);
-            }
+            certificate = CertificateFactory.FromPfx(pfx);
         }
         catch (Exception e) when (e is not OperationCanceledException)
         {
             Log.StoredCertificateUnreadable(logger, e);
+            return false;
         }
+
+        var current = selector.Current;
+        var ignored = !certificate.Covers(Options.Domains) ? "it covers other domains"
+            : certificate.NotAfter <= time.GetUtcNow() ? "it has expired"
+            : null;
+
+        // NotBefore, not NotAfter: a newer certificate can expire sooner, after a switch to a shorter profile.
+        if (ignored is null && (current.IsFallback || !current.Covers(Options.Domains) || certificate.NotBefore > current.NotBefore))
+        {
+            selector.Use(certificate);
+            Log.LoadedCertificate(logger, string.Join(", ", certificate.DnsNames), certificate.NotAfter);
+            return true;
+        }
+
+        if (startup && ignored is not null)
+            Log.StoredCertificateIgnored(logger, ignored);
+        certificate.Dispose();
+        return false;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -83,22 +112,29 @@ internal sealed class AcmeRenewalService(
             return;
 
         var failures = 0;
-        while (!stoppingToken.IsCancellationRequested)
+        try
         {
-            TimeSpan wait;
-            try
+            while (!stoppingToken.IsCancellationRequested)
             {
-                wait = await CheckAsync(stoppingToken).ConfigureAwait(false);
-                failures = 0;
-            }
-            catch (Exception e) when (!stoppingToken.IsCancellationRequested)
-            {
-                failures++;
-                wait = RenewalPlanner.GetRetryDelay(failures, (e as AcmeException)?.RetryAfter);
-                Log.RenewalFailed(logger, e, failures, wait);
-            }
+                TimeSpan wait;
+                try
+                {
+                    wait = await CheckAsync(stoppingToken).ConfigureAwait(false);
+                    failures = 0;
+                }
+                catch (Exception e) when (!stoppingToken.IsCancellationRequested)
+                {
+                    failures++;
+                    wait = RenewalPlanner.GetRetryDelay(failures, (e as AcmeException)?.RetryAfter);
+                    Log.RenewalFailed(logger, e, failures, wait);
+                }
 
-            await SleepAsync(wait, stoppingToken).ConfigureAwait(false);
+                await SleepAsync(wait, stoppingToken).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            await ReleaseLockAsync().ConfigureAwait(false);
         }
     }
 
@@ -106,6 +142,7 @@ internal sealed class AcmeRenewalService(
     internal async Task<TimeSpan> CheckAsync(CancellationToken cancellationToken)
     {
         await TrySaveAsync().ConfigureAwait(false);
+        await LoadStoredAsync(startup: false, cancellationToken).ConfigureAwait(false);
 
         var current = selector.Current;
         string? replaces = null;
@@ -119,17 +156,41 @@ internal sealed class AcmeRenewalService(
             var renewAt = RenewalPlanner.GetRenewalTime(current.NotBefore, current.NotAfter, window, Options.RenewBefore, _windowPosition);
             if (renewAt > now)
             {
+                await ReleaseLockAsync().ConfigureAwait(false);
                 var wait = RenewalPlanner.GetWaitTime(now, renewAt, retryAfter);
                 Log.RenewalScheduled(logger, renewAt, wait);
                 return wait;
             }
         }
 
+        if (_lock is null)
+        {
+            _lock = await renewalLock.TryAcquireAsync(issuer.CertificateKey, cancellationToken).ConfigureAwait(false);
+            if (_lock is null)
+            {
+                Log.RenewalLocked(logger, LockedRetry);
+                return LockedRetry;
+            }
+
+            // The previous holder may have stored a certificate since we looked: check again before ordering.
+            if (await LoadStoredAsync(startup: false, cancellationToken).ConfigureAwait(false))
+                return TimeSpan.Zero;
+        }
+
         var started = time.GetTimestamp();
+        var lost = (_lock as ILosableLock)?.Lost ?? CancellationToken.None;
+        using var orderCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, lost);
         CertificateBundle issued;
         try
         {
-            issued = await issuer.IssueAsync(replaces, cancellationToken).ConfigureAwait(false);
+            issued = await issuer.IssueAsync(replaces, orderCancellation.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (lost.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            // Another instance may hold the lock now: leave the order to it and pick up what it stores.
+            metrics.RecordIssuance(success: false, time.GetElapsedTime(started));
+            await ReleaseLockAsync().ConfigureAwait(false);
+            return LockedRetry;
         }
         catch
         {
@@ -148,7 +209,23 @@ internal sealed class AcmeRenewalService(
 
         selector.Use(issued);
         _windowPosition = Random.Shared.NextDouble();
+        await ReleaseLockAsync().ConfigureAwait(false);
         return TimeSpan.Zero;
+    }
+
+    private async Task ReleaseLockAsync()
+    {
+        if (Interlocked.Exchange(ref _lock, null) is not { } held)
+            return;
+        try
+        {
+            await held.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception e)
+        {
+            // A lock that expires frees itself; one that doesn't is released when the process exits.
+            Log.LockReleaseFailed(logger, e);
+        }
     }
 
     /// <summary>Writes the last issued certificate to the store, if it isn't there yet.</summary>

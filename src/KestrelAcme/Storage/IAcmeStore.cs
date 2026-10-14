@@ -8,6 +8,8 @@ namespace KestrelAcme.Storage;
 /// Keys are relative paths with forward slashes, one folder per CA directory, such as
 /// <c>accounts/acme-v02.api.letsencrypt.org_directory/account.pem</c> (PEM, the account key) and
 /// <c>certificates/acme-v02.api.letsencrypt.org_directory/example.com.pfx</c> (PKCS#12, certificate, chain and key).
+/// While an order runs, <c>challenges/…</c> keys hold challenge answers, so that every instance sharing the store can
+/// answer the certificate authority.
 /// Values contain private keys: store them with care. Members added in later versions will have default
 /// implementations, so implementing this interface stays source-compatible.
 /// </remarks>
@@ -18,4 +20,10 @@ public interface IAcmeStore
 
     /// <summary>Stores a value, replacing any existing one.</summary>
     Task WriteAsync(string key, byte[] value, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Removes a value, if there is one. Used for challenge answers, which are only needed while an order runs;
+    /// the default implementation leaves them in place.
+    /// </summary>
+    Task DeleteAsync(string key, CancellationToken cancellationToken) => Task.CompletedTask;
 }

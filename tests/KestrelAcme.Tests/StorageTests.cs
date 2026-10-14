@@ -30,6 +30,37 @@ public sealed class StorageTests : IDisposable
         Assert.Equal([1], await store.ReadAsync("accounts/ca/account.pem", default));
     }
 
+    [Fact]
+    public async Task Deleting_removes_the_value_and_ignores_missing_ones()
+    {
+        var store = new FileSystemAcmeStore(_root);
+        await store.WriteAsync("challenges/ca/http-01/token", [1], default);
+
+        await store.DeleteAsync("challenges/ca/http-01/token", default);
+        await store.DeleteAsync("challenges/ca/http-01/token", default);
+        await store.DeleteAsync("nowhere/at/all", default);
+
+        Assert.Null(await store.ReadAsync("challenges/ca/http-01/token", default));
+    }
+
+    [Fact]
+    public async Task The_file_lock_has_one_holder_at_a_time()
+    {
+        // Two lock objects, as two instances sharing the folder would have.
+        var first = new FileSystemAcmeLock(new FileSystemAcmeStore(_root));
+        var second = new FileSystemAcmeLock(new FileSystemAcmeStore(_root));
+
+        var held = await first.TryAcquireAsync("certificates/ca/example.com.pfx", default);
+        Assert.NotNull(held);
+        Assert.Null(await second.TryAcquireAsync("certificates/ca/example.com.pfx", default));
+        await using (var other = await second.TryAcquireAsync("certificates/ca/other.com.pfx", default))
+            Assert.NotNull(other); // other certificates aren't blocked
+
+        await held!.DisposeAsync();
+        await using var taken = await second.TryAcquireAsync("certificates/ca/example.com.pfx", default);
+        Assert.NotNull(taken);
+    }
+
     [Theory]
     [InlineData("../outside.pem")]
     [InlineData("accounts/../../outside.pem")]
