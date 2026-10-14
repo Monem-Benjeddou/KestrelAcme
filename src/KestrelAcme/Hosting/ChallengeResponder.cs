@@ -33,11 +33,18 @@ internal sealed class ChallengeResponder(
 
     private static readonly TimeSpan RefreshTimeout = TimeSpan.FromSeconds(10);
 
+    /// <summary>A copy of the published answers older than this is read again even on a hit, so removed answers drop out.</summary>
+    internal static readonly TimeSpan MaxAge = TimeSpan.FromMinutes(1);
+
     private readonly ConcurrentDictionary<string, string> _http01 = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, CertificateBundle> _tlsAlpn01 = new(StringComparer.OrdinalIgnoreCase);
 
     private readonly object _gate = new();
     private volatile Dictionary<string, string> _published = [];
+
+    // Built once per published answer, not per connection: generating a key per connection would let anyone
+    // offering acme-tls/1 burn CPU. Entries are retired when the answer disappears from the published copy.
+    private readonly ConcurrentDictionary<string, CertificateBundle> _sharedTlsAlpn01 = new(StringComparer.Ordinal);
     private long _refreshedAt;
     private Task _refreshing = Task.CompletedTask;
 
@@ -98,7 +105,8 @@ internal sealed class ChallengeResponder(
     }
 
     /// <summary>
-    /// A TLS-ALPN-01 certificate built from an answer another instance published, or null. The caller disposes it.
+    /// The TLS-ALPN-01 certificate for an answer another instance published, or null. Shared between connections;
+    /// it stays valid for the handshake because retirement waits <see cref="CertificateBundle.RetirementDelay"/>.
     /// </summary>
     public async Task<CertificateBundle?> LoadSharedTlsAlpn01Async(string domain, CancellationToken cancellationToken)
     {
@@ -106,7 +114,17 @@ internal sealed class ChallengeResponder(
             return null;
         domain = domain.ToLowerInvariant();
         var keyAuthorization = await FindPublishedAsync($"{AcmeChallenge.TlsAlpn01} {domain}", cancellationToken).ConfigureAwait(false);
-        return keyAuthorization is null ? null : CertificateFactory.CreateTlsAlpnChallenge(domain, keyAuthorization, time.GetUtcNow());
+        if (keyAuthorization is null)
+            return null;
+
+        var key = $"{domain} {keyAuthorization}";
+        if (_sharedTlsAlpn01.TryGetValue(key, out var existing))
+            return existing;
+        var built = CertificateFactory.CreateTlsAlpnChallenge(domain, keyAuthorization, time.GetUtcNow());
+        if (_sharedTlsAlpn01.TryAdd(key, built))
+            return built;
+        built.Dispose();
+        return _sharedTlsAlpn01[key];
     }
 
     /// <summary>
@@ -115,7 +133,7 @@ internal sealed class ChallengeResponder(
     /// </summary>
     private async Task<string?> FindPublishedAsync(string id, CancellationToken cancellationToken)
     {
-        if (_published.TryGetValue(id, out var keyAuthorization))
+        if (_published.TryGetValue(id, out var keyAuthorization) && time.GetElapsedTime(_refreshedAt) < MaxAge)
             return keyAuthorization;
 
         Task refresh;
@@ -151,6 +169,15 @@ internal sealed class ChallengeResponder(
                     published[$"{parts[0]} {parts[1]}"] = parts[2];
             }
             _published = published;
+
+            // Answers that are gone take their certificates with them.
+            foreach (var (key, certificate) in _sharedTlsAlpn01)
+            {
+                var space = key.IndexOf(' ');
+                if (!published.TryGetValue($"{AcmeChallenge.TlsAlpn01} {key[..space]}", out var current) || current != key[(space + 1)..])
+                    if (_sharedTlsAlpn01.TryRemove(key, out var removed))
+                        removed.Retire(time);
+            }
         }
         catch (Exception e)
         {

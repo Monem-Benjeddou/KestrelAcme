@@ -2,8 +2,11 @@ bin/
 obj/
 artifacts/
 .pebble/
+temp_auto_push.bat
 .kind/
 .vs/
 .idea/
 *.user
 TestResults/
+.gitignore
+branch_structure.json

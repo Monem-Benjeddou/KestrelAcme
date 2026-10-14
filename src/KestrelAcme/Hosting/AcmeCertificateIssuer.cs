@@ -180,7 +180,8 @@ internal sealed class AcmeCertificateIssuer(
             if (shared.Count > 0 && challenges.Shares)
             {
                 await challenges.PublishAsync(shared, cancellationToken).ConfigureAwait(false);
-                cleanup.Add(challenges.UnpublishAsync);
+                // Skipped once the order is cancelled: by then another instance may have published its own answers.
+                cleanup.Add(() => cancellationToken.IsCancellationRequested ? Task.CompletedTask : challenges.UnpublishAsync());
                 delay = ChallengeResponder.PublishDelay;
             }
             if (pending.Any(p => p.Challenge.Type == AcmeChallenge.Dns01) && Options.DnsPropagationDelay > delay)
@@ -228,6 +229,8 @@ internal sealed class AcmeCertificateIssuer(
         var domain = authorization.Identifier.Value;
         var shown = authorization.Wildcard ? "*." + domain : domain;
 
+        EnsureOrdered(Options.Domains, shown);
+
         var challenge = preference
             .Select(type => authorization.Challenges.FirstOrDefault(c => c.Type == type))
             .FirstOrDefault(c => c is not null)
@@ -271,6 +274,13 @@ internal sealed class AcmeCertificateIssuer(
         }
 
         return challenge;
+    }
+
+    /// <summary>The CA chose the identifier; only ones we ordered may reach the DNS provider, a challenge certificate or the store.</summary>
+    internal static void EnsureOrdered(IList<string> domains, string identifier)
+    {
+        if (!domains.Contains(identifier, StringComparer.Ordinal))
+            throw new AcmeException($"The certificate authority asked to validate {identifier}, which was not ordered.");
     }
 
     private async Task WaitForValidationAsync(AcmeClient client, PendingChallenge pending, CancellationToken cancellationToken)

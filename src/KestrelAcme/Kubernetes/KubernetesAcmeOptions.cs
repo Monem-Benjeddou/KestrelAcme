@@ -58,6 +58,7 @@ namespace KestrelAcme
             services.AddSingleton<IAcmeStore, KubernetesSecretStore>();
             services.AddSingleton<IAcmeLock, KubernetesLeaseLock>();
             services.AddHttpClient(HttpClientName)
+                .RedactLoggedHeaders(["Authorization"])
                 .ConfigurePrimaryHttpMessageHandler(sp => KubernetesApi.CreateHandler(sp.GetRequiredService<IOptions<KubernetesAcmeOptions>>().Value));
             return services;
         }

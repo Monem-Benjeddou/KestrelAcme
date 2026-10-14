@@ -156,4 +156,19 @@ public class OptionsTests
         var options = services.BuildServiceProvider().GetRequiredService<IOptions<AcmeOptions>>().Value;
         Assert.Equal(["example.com", "www.example.com"], options.Domains);
     }
+
+    [Theory]
+    [InlineData("example.com", true)]
+    [InlineData("*.example.com", true)]
+    [InlineData("evil.example.com", false)]
+    [InlineData("EXAMPLE.COM", false)]
+    [InlineData("victim.example", false)]
+    public void Identifiers_the_certificate_authority_asks_to_validate_must_have_been_ordered(string identifier, bool ordered)
+    {
+        List<string> domains = ["example.com", "*.example.com"];
+        if (ordered)
+            KestrelAcme.Hosting.AcmeCertificateIssuer.EnsureOrdered(domains, identifier);
+        else
+            Assert.Throws<AcmeException>(() => KestrelAcme.Hosting.AcmeCertificateIssuer.EnsureOrdered(domains, identifier));
+    }
 }

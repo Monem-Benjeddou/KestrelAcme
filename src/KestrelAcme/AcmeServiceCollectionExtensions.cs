@@ -89,6 +89,7 @@ public static class AcmeServiceCollectionExtensions
         {
             client.DefaultRequestHeaders.UserAgent.ParseAdd($"KestrelAcme/{typeof(AcmeOptions).Assembly.GetName().Version?.ToString(3)}");
             client.Timeout = TimeSpan.FromSeconds(30);
+            client.MaxResponseContentBufferSize = 1 << 20; // ACME responses are a few KB; a certificate chain, tens
         });
 
         services.AddSingleton<AcmeRenewalService>();
