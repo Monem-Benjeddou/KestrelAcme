@@ -1,5 +1,7 @@
 using KestrelAcme.Hosting;
 using KestrelAcme.Storage;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace KestrelAcme.Tests;
 
@@ -59,6 +61,74 @@ public sealed class StorageTests : IDisposable
         await held!.DisposeAsync();
         await using var taken = await second.TryAcquireAsync("certificates/ca/example.com.pfx", default);
         Assert.NotNull(taken);
+    }
+
+    [Fact]
+    public async Task A_custom_store_without_a_lock_says_once_that_instances_wont_coordinate()
+    {
+        var logs = new EventCounter();
+        var services = new ServiceCollection()
+            .AddSingleton<IAcmeStore, MemoryStore>()
+            .AddLogging(b => b.AddProvider(logs))
+            .AddKestrelAcme(o => o.Domains.Add("example.com"));
+        var acmeLock = services.BuildServiceProvider().GetRequiredService<IAcmeLock>();
+
+        await (await acmeLock.TryAcquireAsync("a", default))!.DisposeAsync();
+        await (await acmeLock.TryAcquireAsync("a", default))!.DisposeAsync();
+
+        Assert.Equal(1, logs.Count(26));
+    }
+
+    [Fact]
+    public void The_file_store_gets_the_file_lock()
+    {
+        var services = new ServiceCollection().AddKestrelAcme(o =>
+        {
+            o.Domains.Add("example.com");
+            o.AcceptTermsOfService = true;
+            o.StoragePath = _root;
+        });
+        Assert.IsType<FileSystemAcmeLock>(services.BuildServiceProvider().GetRequiredService<IAcmeLock>());
+    }
+
+    [Theory]
+    [InlineData("kestrelacme", true)]
+    [InlineData("my-app-2", true)]
+    [InlineData("My-App", false)]
+    [InlineData("my_app", false)]
+    [InlineData("-app", false)]
+    [InlineData("app-", false)]
+    [InlineData("", false)]
+    [InlineData("a234567890123456789012345678901234567890", true)]
+    [InlineData("a2345678901234567890123456789012345678901", false)]
+    public void Kubernetes_names_must_fit_object_name_rules(string name, bool valid) =>
+        Assert.Equal(valid, KubernetesAcmeServiceCollectionExtensions.IsValidName(name));
+
+    private sealed class MemoryStore : IAcmeStore
+    {
+        public Task<byte[]?> ReadAsync(string key, CancellationToken cancellationToken) => Task.FromResult<byte[]?>(null);
+
+        public Task WriteAsync(string key, byte[] value, CancellationToken cancellationToken) => Task.CompletedTask;
+    }
+
+    private sealed class EventCounter : ILoggerProvider, ILogger
+    {
+        private readonly System.Collections.Concurrent.ConcurrentBag<int> _events = [];
+
+        public int Count(int eventId) => _events.Count(e => e == eventId);
+
+        public ILogger CreateLogger(string categoryName) => this;
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter) =>
+            _events.Add(eventId.Id);
+
+        public void Dispose()
+        {
+        }
     }
 
     [Theory]

@@ -8,6 +8,7 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Xunit.Abstractions;
 
 namespace KestrelAcme.IntegrationTests;
@@ -123,5 +124,37 @@ internal sealed class TestOutputLoggerProvider(ITestOutputHelper output) : ILogg
                 // The test has finished; xunit no longer accepts output.
             }
         }
+    }
+}
+
+/// <summary>Counts order attempts, from the issuer's "Ordering a certificate" log entries.</summary>
+internal sealed class OrderCounter : ILoggerProvider, ILogger
+{
+    private readonly TaskCompletionSource _firstOrder = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private int _count;
+
+    public int Count => _count;
+
+    public Task FirstOrder => _firstOrder.Task;
+
+    public ILogger CreateLogger(string categoryName) => categoryName.EndsWith(".AcmeCertificateIssuer", StringComparison.Ordinal)
+        ? this
+        : NullLogger.Instance;
+
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+    public bool IsEnabled(LogLevel logLevel) => true;
+
+    public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+    {
+        if (eventId.Id == 6) // Log.Ordering
+        {
+            Interlocked.Increment(ref _count);
+            _firstOrder.TrySetResult();
+        }
+    }
+
+    public void Dispose()
+    {
     }
 }

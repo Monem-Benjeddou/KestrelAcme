@@ -1,5 +1,23 @@
 # Changelog
 
+## [Unreleased]
+
+Fixes from a review of the multi-instance support, all with tests:
+
+- Challenge answers are published once per order and read at most once a second by the other instances, instead of
+  one store read per request with a limit of 4: under Let's Encrypt's multi-location validation, or requests for
+  made-up tokens, answers could be refused and validation fail.
+- A Kubernetes lease renewal that hangs is cut off at the 40 s deadline, so the holder still gives up before another
+  replica can take over.
+- The lock is kept until the issued certificate is stored, so another instance doesn't order again.
+- An error reading the store backs off instead of counting as "no certificate" and ordering.
+- With a custom `IAcmeStore` and no `IAcmeLock`, nothing is written to or read from the store for challenges, and a
+  log line says instances won't coordinate.
+- `KubernetesAcmeOptions.Name` is validated at startup.
+- `IAcmeLockHandle` (public) lets a custom lock signal that it was lost.
+- The Kubernetes API server's intermediate certificates are used to validate it.
+- HTTP-01 answers are logged at Debug, as TLS-ALPN-01 answers are.
+
 ## [0.2.0]
 
 - Several instances behind a load balancer share one certificate. One orders it under a lock (`IAcmeLock`), held

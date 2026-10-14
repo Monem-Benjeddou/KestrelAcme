@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text;
 using KestrelAcme.Certificates;
+using KestrelAcme.Protocol;
 using KestrelAcme.Storage;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -8,19 +9,43 @@ using Microsoft.Extensions.Options;
 namespace KestrelAcme.Hosting;
 
 /// <summary>
-/// The challenge responses currently being served, while an order is in progress. Answers are also shared through
-/// the store, so another instance behind the same load balancer can answer when the certificate authority reaches it.
+/// The challenge responses currently being served, while an order is in progress. When instances coordinate, the
+/// ordering one also publishes its answers to the store, so another instance behind the same load balancer can answer
+/// when the certificate authority reaches it.
 /// </summary>
-internal sealed class ChallengeResponder(IAcmeStore store, IOptions<AcmeOptions> options, TimeProvider time, ILogger<ChallengeResponder> logger)
+internal sealed class ChallengeResponder(
+    IAcmeStore store, IAcmeLock acmeLock, IOptions<AcmeOptions> options, TimeProvider time, ILogger<ChallengeResponder> logger)
 {
     public const string AcmeTlsProtocol = "acme-tls/1";
     public const string Http01PathPrefix = "/.well-known/acme-challenge/";
 
+    /// <summary>
+    /// How long the ordering instance waits between publishing its answers and letting the CA check them. Longer than
+    /// <see cref="MinRefreshInterval"/>, so an instance whose copy predates the publication reads it again in time.
+    /// </summary>
+    internal static readonly TimeSpan PublishDelay = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    /// Instances read the published answers at most this often, however many requests come in: anyone can ask for a
+    /// made-up token, and those requests must not turn into a stream of store (or Kubernetes API) reads.
+    /// </summary>
+    internal static readonly TimeSpan MinRefreshInterval = TimeSpan.FromSeconds(1);
+
+    private static readonly TimeSpan RefreshTimeout = TimeSpan.FromSeconds(10);
+
     private readonly ConcurrentDictionary<string, string> _http01 = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, CertificateBundle> _tlsAlpn01 = new(StringComparer.OrdinalIgnoreCase);
 
-    // Anyone can ask for a made-up token: bound how many of those reach the store at once.
-    private readonly SemaphoreSlim _storeLookups = new(4, 4);
+    private readonly object _gate = new();
+    private volatile Dictionary<string, string> _published = [];
+    private long _refreshedAt;
+    private Task _refreshing = Task.CompletedTask;
+
+    /// <summary>
+    /// Whether answers go through the store. Not with a custom store that has no lock: those instances don't
+    /// coordinate, and the store is left as it was before multi-instance support.
+    /// </summary>
+    public bool Shares { get; } = acmeLock is not UncoordinatedAcmeLock;
 
     public void AddHttp01(string token, string keyAuthorization) => _http01[token] = keyAuthorization;
 
@@ -40,72 +65,108 @@ internal sealed class ChallengeResponder(IAcmeStore store, IOptions<AcmeOptions>
         return domain is not null && _tlsAlpn01.TryGetValue(domain, out certificate!);
     }
 
-    public string Http01Key(string token) => $"challenges/{AcmeCertificateIssuer.StoreName(options.Value.DirectoryUri)}/http-01/{token}";
+    /// <summary>One key per certificate: every instance serving it reads the same one.</summary>
+    public string PublishedKey =>
+        $"challenges/{AcmeCertificateIssuer.StoreName(options.Value.DirectoryUri)}/{AcmeCertificateIssuer.FileName(options.Value.Domains[0])}.txt";
 
-    public string TlsAlpn01Key(string domain) => $"challenges/{AcmeCertificateIssuer.StoreName(options.Value.DirectoryUri)}/tls-alpn-01/{domain}";
+    /// <summary>Publishes an order's HTTP-01 tokens and TLS-ALPN-01 domains with their key authorizations.</summary>
+    public async Task PublishAsync(IReadOnlyCollection<SharedAnswer> answers, CancellationToken cancellationToken)
+    {
+        var text = new StringBuilder();
+        foreach (var answer in answers)
+            text.Append(answer.Type).Append(' ').Append(answer.Id).Append(' ').Append(answer.KeyAuthorization).Append('\n');
+        try
+        {
+            await store.WriteAsync(PublishedKey, Encoding.ASCII.GetBytes(text.ToString()), cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            Log.ChallengeShareFailed(logger, e); // this instance still answers from memory
+        }
+    }
 
-    /// <summary>The answer for an HTTP-01 token: this instance's, or one another instance shared.</summary>
+    public Task UnpublishAsync() => store.DeleteAsync(PublishedKey, CancellationToken.None);
+
+    /// <summary>The answer for an HTTP-01 token: this instance's, or one another instance published.</summary>
     public async Task<string?> FindHttp01Async(string token, CancellationToken cancellationToken)
     {
         if (TryGetHttp01(token, out var keyAuthorization))
             return keyAuthorization;
-        if (!IsToken(token))
-            return null;
-        return await ReadSharedAsync(Http01Key(token), cancellationToken).ConfigureAwait(false);
+        return Shares && IsToken(token)
+            ? await FindPublishedAsync($"{AcmeChallenge.Http01} {token}", cancellationToken).ConfigureAwait(false)
+            : null;
     }
 
     /// <summary>
-    /// A TLS-ALPN-01 certificate built from an answer another instance shared, or null. The caller disposes it.
+    /// A TLS-ALPN-01 certificate built from an answer another instance published, or null. The caller disposes it.
     /// </summary>
     public async Task<CertificateBundle?> LoadSharedTlsAlpn01Async(string domain, CancellationToken cancellationToken)
     {
-        if (!IsHostName(domain))
+        if (!Shares || !IsHostName(domain))
             return null;
-        var keyAuthorization = await ReadSharedAsync(TlsAlpn01Key(domain.ToLowerInvariant()), cancellationToken).ConfigureAwait(false);
+        domain = domain.ToLowerInvariant();
+        var keyAuthorization = await FindPublishedAsync($"{AcmeChallenge.TlsAlpn01} {domain}", cancellationToken).ConfigureAwait(false);
         return keyAuthorization is null ? null : CertificateFactory.CreateTlsAlpnChallenge(domain, keyAuthorization, time.GetUtcNow());
     }
 
-    /// <summary>Publishes an answer for other instances. Best effort: this instance answers from memory regardless.</summary>
-    public async Task ShareAsync(string key, string keyAuthorization, CancellationToken cancellationToken)
+    /// <summary>
+    /// Looks in this instance's copy of the published answers, reading the store again on a miss if the last read
+    /// started at least <see cref="MinRefreshInterval"/> ago. Concurrent misses share one read.
+    /// </summary>
+    private async Task<string?> FindPublishedAsync(string id, CancellationToken cancellationToken)
+    {
+        if (_published.TryGetValue(id, out var keyAuthorization))
+            return keyAuthorization;
+
+        Task refresh;
+        lock (_gate)
+        {
+            // A completed task, not null, marks "no read running": a read that completes synchronously would otherwise
+            // clear the field before it is set, and block every later read.
+            if (_refreshing.IsCompleted && time.GetElapsedTime(_refreshedAt) >= MinRefreshInterval)
+            {
+                _refreshedAt = time.GetTimestamp();
+                _refreshing = RefreshAsync();
+            }
+            refresh = _refreshing;
+        }
+
+        await refresh.WaitAsync(cancellationToken).ConfigureAwait(false);
+        return _published.GetValueOrDefault(id);
+    }
+
+    private async Task RefreshAsync()
     {
         try
         {
-            await store.WriteAsync(key, Encoding.ASCII.GetBytes(keyAuthorization), cancellationToken).ConfigureAwait(false);
+            // Not tied to the request that triggered it: others may be waiting on the same read.
+            using var timeout = new CancellationTokenSource(RefreshTimeout, time);
+            var value = await store.ReadAsync(PublishedKey, timeout.Token).ConfigureAwait(false);
+
+            var published = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var line in Encoding.ASCII.GetString(value ?? []).Split('\n', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var parts = line.Split(' ');
+                if (parts.Length == 3)
+                    published[$"{parts[0]} {parts[1]}"] = parts[2];
+            }
+            _published = published;
         }
-        catch (Exception e) when (e is not OperationCanceledException)
+        catch (Exception e)
         {
-            Log.ChallengeShareFailed(logger, e);
+            Log.ChallengeLookupFailed(logger, PublishedKey, e);
         }
     }
 
-    public Task UnshareAsync(string key) => store.DeleteAsync(key, CancellationToken.None);
-
-    private async Task<string?> ReadSharedAsync(string key, CancellationToken cancellationToken)
-    {
-        if (!_storeLookups.Wait(0))
-            return null;
-        try
-        {
-            var value = await store.ReadAsync(key, cancellationToken).ConfigureAwait(false);
-            return value is null ? null : Encoding.ASCII.GetString(value);
-        }
-        catch (Exception e) when (e is not OperationCanceledException)
-        {
-            Log.ChallengeLookupFailed(logger, key, e);
-            return null;
-        }
-        finally
-        {
-            _storeLookups.Release();
-        }
-    }
-
-    /// <summary>A challenge token: base64url, at least 128 bits (RFC 8555 §8.3). Anything else never reaches the store.</summary>
+    /// <summary>A challenge token: base64url, at least 128 bits (RFC 8555 §8.3). Anything else is never looked up.</summary>
     internal static bool IsToken(string token) =>
         token.Length is >= 22 and <= 128 && token.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_');
 
-    /// <summary>An ASCII host name, as sent in SNI. Anything else never reaches the store.</summary>
+    /// <summary>An ASCII host name, as sent in SNI. Anything else is never looked up.</summary>
     internal static bool IsHostName(string name) =>
         name.Length is > 0 and <= 253 && name[0] != '.' && !name.Contains("..", StringComparison.Ordinal)
         && name.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '.');
 }
+
+/// <summary>An answer another instance may have to give: an HTTP-01 token or a TLS-ALPN-01 domain, and its key authorization.</summary>
+internal sealed record SharedAnswer(string Type, string Id, string KeyAuthorization);

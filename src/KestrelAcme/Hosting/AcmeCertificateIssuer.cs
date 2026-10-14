@@ -163,22 +163,33 @@ internal sealed class AcmeCertificateIssuer(
         {
             // 1. Put every challenge response in place.
             var pending = new List<PendingChallenge>();
+            var shared = new List<SharedAnswer>();
             foreach (var authorizationUrl in order.Value.Authorizations)
             {
                 var authorization = (await client.GetAuthorizationAsync(authorizationUrl, cancellationToken).ConfigureAwait(false)).Value;
                 if (authorization.Status == AcmeStatus.Valid)
                     continue; // Validated recently; the CA reuses it.
 
-                var challenge = await PrepareAsync(client, authorization, preference, cleanup, cancellationToken).ConfigureAwait(false);
+                var challenge = await PrepareAsync(client, authorization, preference, cleanup, shared, cancellationToken).ConfigureAwait(false);
                 pending.Add(new PendingChallenge(authorizationUrl, authorization.Identifier.Value, challenge));
             }
 
-            // 2. Give new DNS records time to reach the authoritative servers.
-            if (pending.Any(p => p.Challenge.Type == AcmeChallenge.Dns01) && Options.DnsPropagationDelay > TimeSpan.Zero)
+            // 2. Let other instances answer too: the CA may reach any of them. Then wait long enough for them to read
+            //    the answers (ChallengeResponder.PublishDelay), and for new DNS records to reach the authoritative servers.
+            var delay = TimeSpan.Zero;
+            if (shared.Count > 0 && challenges.Shares)
             {
-                Log.WaitingForDns(logger, Options.DnsPropagationDelay);
-                await Task.Delay(Options.DnsPropagationDelay, time, cancellationToken).ConfigureAwait(false);
+                await challenges.PublishAsync(shared, cancellationToken).ConfigureAwait(false);
+                cleanup.Add(challenges.UnpublishAsync);
+                delay = ChallengeResponder.PublishDelay;
             }
+            if (pending.Any(p => p.Challenge.Type == AcmeChallenge.Dns01) && Options.DnsPropagationDelay > delay)
+            {
+                delay = Options.DnsPropagationDelay;
+                Log.WaitingForDns(logger, delay);
+            }
+            if (delay > TimeSpan.Zero)
+                await Task.Delay(delay, time, cancellationToken).ConfigureAwait(false);
 
             // 3. Ask for validation of all of them, then wait: the CA checks them in parallel.
             foreach (var p in pending)
@@ -211,7 +222,7 @@ internal sealed class AcmeCertificateIssuer(
     /// <summary>Picks the challenge for one authorization and serves (or publishes) its response.</summary>
     private async Task<AcmeChallenge> PrepareAsync(
         AcmeClient client, AcmeAuthorization authorization, IReadOnlyList<string> preference, List<Func<Task>> cleanup,
-        CancellationToken cancellationToken)
+        List<SharedAnswer> shared, CancellationToken cancellationToken)
     {
         // For "*.example.com" the identifier is "example.com" with wildcard: true (RFC 8555 §7.1.4).
         var domain = authorization.Identifier.Value;
@@ -236,9 +247,7 @@ internal sealed class AcmeCertificateIssuer(
                     challenges.RemoveHttp01(challenge.Token);
                     return Task.CompletedTask;
                 });
-                var http01Key = challenges.Http01Key(challenge.Token);
-                await challenges.ShareAsync(http01Key, keyAuthorization, cancellationToken).ConfigureAwait(false);
-                cleanup.Add(() => challenges.UnshareAsync(http01Key));
+                shared.Add(new SharedAnswer(AcmeChallenge.Http01, challenge.Token, keyAuthorization));
                 break;
 
             case AcmeChallenge.TlsAlpn01:
@@ -249,9 +258,7 @@ internal sealed class AcmeCertificateIssuer(
                         certificate.Retire(time);
                     return Task.CompletedTask;
                 });
-                var tlsAlpn01Key = challenges.TlsAlpn01Key(domain);
-                await challenges.ShareAsync(tlsAlpn01Key, keyAuthorization, cancellationToken).ConfigureAwait(false);
-                cleanup.Add(() => challenges.UnshareAsync(tlsAlpn01Key));
+                shared.Add(new SharedAnswer(AcmeChallenge.TlsAlpn01, domain.ToLowerInvariant(), keyAuthorization));
                 break;
 
             case AcmeChallenge.Dns01:

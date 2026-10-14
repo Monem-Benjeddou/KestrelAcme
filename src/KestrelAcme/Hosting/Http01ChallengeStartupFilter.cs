@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
 
 namespace KestrelAcme.Hosting;
 
@@ -9,7 +10,7 @@ namespace KestrelAcme.Hosting;
 /// authentication or routing can't get in the way. Tokens of another instance's order are answered from the store;
 /// unknown tokens fall through to the app.
 /// </summary>
-internal sealed class Http01ChallengeStartupFilter(ChallengeResponder challenges) : IStartupFilter
+internal sealed class Http01ChallengeStartupFilter(ChallengeResponder challenges, ILogger<Http01ChallengeStartupFilter> logger) : IStartupFilter
 {
     public Action<IApplicationBuilder> Configure(Action<IApplicationBuilder> next) => app =>
     {
@@ -21,6 +22,7 @@ internal sealed class Http01ChallengeStartupFilter(ChallengeResponder challenges
                 && rest.Value is { Length: > 1 } tokenPath
                 && await challenges.FindHttp01Async(tokenPath[1..], context.RequestAborted).ConfigureAwait(false) is { } keyAuthorization)
             {
+                Log.Http01ChallengeServed(logger, request.Host.Host);
                 context.Response.ContentType = "application/octet-stream";
                 await context.Response.WriteAsync(keyAuthorization, context.RequestAborted).ConfigureAwait(false);
                 return;
