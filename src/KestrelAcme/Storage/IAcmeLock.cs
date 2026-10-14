@@ -10,7 +10,8 @@ namespace KestrelAcme.Storage;
 /// when certificates live in a custom <see cref="IAcmeStore"/>: without one, instances using it don't coordinate.
 /// A lock is held from the start of an order until it succeeds, retries included, so it can be held for hours.
 /// Implementations whose locks expire must keep them alive until the handle is disposed, and expire them soon after
-/// a holder disappears without disposing it.
+/// a holder disappears without disposing it. If such a lock can be lost while held (it couldn't be renewed), the
+/// handle should implement <see cref="IAcmeLockHandle"/>, so the order in progress stops before another instance's starts.
 /// </remarks>
 public interface IAcmeLock
 {
@@ -22,10 +23,14 @@ public interface IAcmeLock
 }
 
 /// <summary>
-/// A held lock that can be lost before it is released (an expiring lease that couldn't be renewed). The order in
-/// progress is abandoned when <see cref="Lost"/> fires, so it doesn't run alongside the next holder's.
+/// Optionally implemented by the handle <see cref="IAcmeLock.TryAcquireAsync"/> returns, for locks that can be lost
+/// before they are released (an expiring lease that couldn't be renewed).
 /// </summary>
-internal interface ILosableLock
+public interface IAcmeLockHandle : IAsyncDisposable
 {
+    /// <summary>
+    /// Cancelled once the lock is lost, or might be: the order in progress is then abandoned, so it doesn't run
+    /// alongside the next holder's. Cancel it before another instance can take the lock over.
+    /// </summary>
     CancellationToken Lost { get; }
 }

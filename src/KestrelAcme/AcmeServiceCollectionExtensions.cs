@@ -78,7 +78,7 @@ public static class AcmeServiceCollectionExtensions
         // The file lock only coordinates instances that share the file store; a custom store needs its own lock.
         services.TryAddSingleton<IAcmeLock>(sp => sp.GetRequiredService<IAcmeStore>() is FileSystemAcmeStore files
             ? new FileSystemAcmeLock(files)
-            : new UncoordinatedAcmeLock());
+            : ActivatorUtilities.CreateInstance<UncoordinatedAcmeLock>(sp));
         services.AddSingleton<CertificateSelector>();
         services.AddSingleton<ChallengeResponder>();
         services.AddSingleton<AcmeCertificateIssuer>();

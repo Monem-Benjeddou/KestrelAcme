@@ -10,8 +10,8 @@ namespace KestrelAcme.Kubernetes
     public sealed class KubernetesAcmeOptions
     {
         /// <summary>
-        /// Prefix of the Secret and Lease names. Apps in one namespace that should not share an ACME account or
-        /// certificates need different names.
+        /// Prefix of the Secret and Lease names: up to 40 lowercase letters, digits and dashes. Apps in one namespace
+        /// that should not share an ACME account or certificates need different names.
         /// </summary>
         public string Name { get; set; } = "kestrelacme";
 
@@ -49,6 +49,9 @@ namespace KestrelAcme
             var options = services.AddOptions<KubernetesAcmeOptions>();
             if (configure is not null)
                 options.Configure(configure);
+            options.Validate(o => IsValidName(o.Name),
+                    "KubernetesAcmeOptions.Name must be 1 to 40 lowercase letters, digits or dashes, starting and ending with a letter or digit.")
+                .ValidateOnStart();
 
             services.TryAddSingleton(TimeProvider.System);
             services.AddSingleton<KubernetesApi>();
@@ -58,5 +61,10 @@ namespace KestrelAcme
                 .ConfigurePrimaryHttpMessageHandler(sp => KubernetesApi.CreateHandler(sp.GetRequiredService<IOptions<KubernetesAcmeOptions>>().Value));
             return services;
         }
+
+        /// <summary>Usable as the start of a Kubernetes object name (RFC 1123), leaving room for the rest.</summary>
+        internal static bool IsValidName(string? name) =>
+            name is { Length: > 0 and <= 40 } && char.IsAsciiLetterOrDigit(name[0]) && char.IsAsciiLetterOrDigit(name[^1])
+            && name.All(c => char.IsAsciiLetterLower(c) || char.IsAsciiDigit(c) || c == '-');
     }
 }

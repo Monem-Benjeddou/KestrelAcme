@@ -32,6 +32,9 @@ internal sealed class AcmeRenewalService(
     /// <summary>How soon an instance that found the lock taken looks again, for the certificate or the lock.</summary>
     internal static readonly TimeSpan LockedRetry = TimeSpan.FromSeconds(30);
 
+    /// <summary>How soon saving an issued certificate is retried after the store failed to take it.</summary>
+    internal static readonly TimeSpan UnsavedRetry = TimeSpan.FromMinutes(1);
+
     private readonly SemaphoreSlim _wake = new(0, 1);
 
     // Picked once per certificate, so the moment inside the CA's window doesn't move every time we look.
@@ -68,21 +71,34 @@ internal sealed class AcmeRenewalService(
     /// </summary>
     private async Task<bool> LoadStoredAsync(bool startup, CancellationToken cancellationToken)
     {
+        byte[]? pfx;
+        try
+        {
+            pfx = await store.ReadAsync(issuer.CertificateKey, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception e) when (startup && e is not OperationCanceledException)
+        {
+            // Not "no certificate": ordering because the store had a hiccup would spend the CA's duplicate-certificate
+            // limit. After startup, the error fails the check, which retries with backoff.
+            Log.StoreUnreadable(logger, e);
+            return false;
+        }
+
+        if (pfx is null)
+        {
+            if (startup)
+                Log.NoStoredCertificate(logger);
+            return false;
+        }
+
         CertificateBundle certificate;
         try
         {
-            var pfx = await store.ReadAsync(issuer.CertificateKey, cancellationToken).ConfigureAwait(false);
-            if (pfx is null)
-            {
-                if (startup)
-                    Log.NoStoredCertificate(logger);
-                return false;
-            }
             certificate = CertificateFactory.FromPfx(pfx);
         }
-        catch (Exception e) when (e is not OperationCanceledException)
+        catch (Exception e)
         {
-            Log.StoredCertificateUnreadable(logger, e);
+            Log.StoredCertificateUnreadable(logger, e); // corrupt: replaced by the next order
             return false;
         }
 
@@ -156,9 +172,11 @@ internal sealed class AcmeRenewalService(
             var renewAt = RenewalPlanner.GetRenewalTime(current.NotBefore, current.NotAfter, window, Options.RenewBefore, _windowPosition);
             if (renewAt > now)
             {
-                await ReleaseLockAsync().ConfigureAwait(false);
                 var wait = RenewalPlanner.GetWaitTime(now, renewAt, retryAfter);
                 Log.RenewalScheduled(logger, renewAt, wait);
+                if (_unsaved is not null)
+                    return wait < UnsavedRetry ? wait : UnsavedRetry; // keep the lock until it's saved
+                await ReleaseLockAsync().ConfigureAwait(false);
                 return wait;
             }
         }
@@ -178,7 +196,7 @@ internal sealed class AcmeRenewalService(
         }
 
         var started = time.GetTimestamp();
-        var lost = (_lock as ILosableLock)?.Lost ?? CancellationToken.None;
+        var lost = (_lock as IAcmeLockHandle)?.Lost ?? CancellationToken.None;
         using var orderCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, lost);
         CertificateBundle issued;
         try
@@ -209,7 +227,10 @@ internal sealed class AcmeRenewalService(
 
         selector.Use(issued);
         _windowPosition = Random.Shared.NextDouble();
-        await ReleaseLockAsync().ConfigureAwait(false);
+
+        // Released before the certificate is stored, the lock would let another instance order one again.
+        if (_unsaved is null)
+            await ReleaseLockAsync().ConfigureAwait(false);
         return TimeSpan.Zero;
     }
 

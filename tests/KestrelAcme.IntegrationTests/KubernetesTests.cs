@@ -1,6 +1,7 @@
 using KestrelAcme.Kubernetes;
 using KestrelAcme.Storage;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Xunit.Abstractions;
@@ -71,7 +72,7 @@ public sealed class KubernetesTests(PebbleFixture pebble, ITestOutputHelper outp
     public async Task A_holder_whose_lease_was_taken_over_notices_at_its_next_renewal()
     {
         var api = CreateApi();
-        var held = (ILosableLock)(await CreateLock(TimeProvider.System).TryAcquireAsync("certificates/ca/example.com.pfx", default))!;
+        var held = (IAcmeLockHandle)(await CreateLock(TimeProvider.System).TryAcquireAsync("certificates/ca/example.com.pfx", default))!;
 
         // Another replica takes it over (the README's Role can't delete leases, only update them).
         var path = $"{api.LeasesPath}/{api.ObjectName("lock", "certificates/ca/example.com.pfx")}";
@@ -81,14 +82,14 @@ public sealed class KubernetesTests(PebbleFixture pebble, ITestOutputHelper outp
 
         await Task.Delay(KubernetesLeaseLock.RenewInterval + TimeSpan.FromSeconds(5));
         Assert.True(held.Lost.IsCancellationRequested);
-        await ((IAsyncDisposable)held).DisposeAsync();
+        await held.DisposeAsync();
     }
 
     [KubernetesFact]
     public async Task A_holder_cut_off_from_the_api_server_gives_up_before_anyone_can_take_over()
     {
         var partition = new Partition();
-        var held = (ILosableLock)(await CreateLock(TimeProvider.System, partition).TryAcquireAsync("certificates/ca/example.com.pfx", default))!;
+        var held = (IAcmeLockHandle)(await CreateLock(TimeProvider.System, partition).TryAcquireAsync("certificates/ca/example.com.pfx", default))!;
         var started = DateTime.UtcNow;
         partition.Cut = true;
 
@@ -100,7 +101,25 @@ public sealed class KubernetesTests(PebbleFixture pebble, ITestOutputHelper outp
         // it. The holder must have given up well before.
         Assert.InRange(DateTime.UtcNow - started, KubernetesLeaseLock.RenewDeadline - TimeSpan.FromSeconds(1),
             KubernetesLeaseLock.LeaseDuration - TimeSpan.FromSeconds(10));
-        await ((IAsyncDisposable)held).DisposeAsync();
+        await held.DisposeAsync();
+    }
+
+    [KubernetesFact]
+    public async Task A_renewal_that_hangs_doesnt_keep_the_holder_past_its_deadline()
+    {
+        // Packets dropped rather than refused: requests hang instead of failing.
+        var partition = new Partition();
+        var held = (IAcmeLockHandle)(await CreateLock(TimeProvider.System, partition).TryAcquireAsync("certificates/ca/example.com.pfx", default))!;
+        var started = DateTime.UtcNow;
+        partition.Hang = true;
+
+        var lost = new TaskCompletionSource();
+        await using var registration = held.Lost.Register(lost.SetResult);
+        await lost.Task.WaitAsync(KubernetesLeaseLock.LeaseDuration);
+
+        Assert.InRange(DateTime.UtcNow - started, KubernetesLeaseLock.RenewDeadline - TimeSpan.FromSeconds(1),
+            KubernetesLeaseLock.LeaseDuration - TimeSpan.FromSeconds(10));
+        await held.DisposeAsync();
     }
 
     [KubernetesFact]
@@ -127,30 +146,40 @@ public sealed class KubernetesTests(PebbleFixture pebble, ITestOutputHelper outp
     [KubernetesFact]
     public async Task Replicas_without_a_shared_volume_order_once_and_serve_the_same_certificate()
     {
-        PebbleDnsProvider dnsA = new(), dnsB = new();
+        var orders = new OrderCounter();
         var startA = TestApp.StartAsync(pebble, output, "k8s.kestrelacme.test", Directory.CreateTempSubdirectory().FullName, Dns01Only,
-            services => services.AddSingleton<IDnsChallengeProvider>(dnsA).AddKestrelAcmeKubernetes(Configure));
+            services => services.AddSingleton<IDnsChallengeProvider>(new PebbleDnsProvider()).AddSingleton<ILoggerProvider>(orders)
+                .AddKestrelAcmeKubernetes(Configure));
         var startB = TestApp.StartAsync(pebble, output, "k8s.kestrelacme.test", Directory.CreateTempSubdirectory().FullName, Dns01Only,
-            services => services.AddSingleton<IDnsChallengeProvider>(dnsB).AddKestrelAcmeKubernetes(Configure), 5102, 5101);
+            services => services.AddSingleton<IDnsChallengeProvider>(new PebbleDnsProvider()).AddSingleton<ILoggerProvider>(orders)
+                .AddKestrelAcmeKubernetes(Configure), 5102, 5101);
         await using var a = await startA;
         await using var b = await startB;
 
         var issuedA = await a.WaitForCertificateAsync();
         var issuedB = await b.WaitForCertificateAsync();
 
-        Assert.Equal(1, dnsA.Added.Count + dnsB.Added.Count);
+        Assert.Equal(1, orders.Count);
         Assert.Equal(issuedA.Leaf.Thumbprint, issuedB.Leaf.Thumbprint);
     }
 
     [KubernetesFact]
-    public async Task Challenges_are_answered_from_secrets_by_the_replica_that_receives_them()
+    public async Task Challenges_are_answered_from_secrets_by_a_replica_that_isnt_ordering()
     {
-        await using var a = await TestApp.StartAsync(pebble, output, "a.k8s.kestrelacme.test", Directory.CreateTempSubdirectory().FullName,
-            o => o.Challenges = AcmeChallengeTypes.Http01, services => services.AddKestrelAcmeKubernetes(Configure));
-        await using var b = await TestApp.StartAsync(pebble, output, "b.k8s.kestrelacme.test", Directory.CreateTempSubdirectory().FullName,
-            o => o.Challenges = AcmeChallengeTypes.Http01, services => services.AddKestrelAcmeKubernetes(Configure), 5102, 5101);
+        var orders = new OrderCounter();
 
-        await b.WaitForCertificateAsync(); // validated through A
+        // B orders, listening where Pebble doesn't validate; A starts meanwhile where it does, and answers for B.
+        await using var b = await TestApp.StartAsync(pebble, output, "shared.k8s.kestrelacme.test", Directory.CreateTempSubdirectory().FullName,
+            o => o.Challenges = AcmeChallengeTypes.Http01,
+            services => services.AddSingleton<ILoggerProvider>(orders).AddKestrelAcmeKubernetes(Configure), 5102, 5101);
+        await orders.FirstOrder.WaitAsync(TimeSpan.FromSeconds(10));
+        await using var a = await TestApp.StartAsync(pebble, output, "shared.k8s.kestrelacme.test", Directory.CreateTempSubdirectory().FullName,
+            o => o.Challenges = AcmeChallengeTypes.Http01,
+            services => services.AddSingleton<ILoggerProvider>(orders).AddKestrelAcmeKubernetes(Configure));
+
+        var issued = await b.WaitForCertificateAsync();
+        Assert.Equal(issued.Leaf.Thumbprint, (await a.WaitForCertificateAsync()).Leaf.Thumbprint);
+        Assert.Equal(1, orders.Count);
     }
 
     private static void Dns01Only(AcmeOptions o)
@@ -206,9 +235,14 @@ public sealed class KubernetesTests(PebbleFixture pebble, ITestOutputHelper outp
     private sealed class Partition : DelegatingHandler
     {
         public volatile bool Cut;
+        public volatile bool Hang;
 
-        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
-            Cut ? throw new HttpRequestException("Network unreachable (simulated).") : base.SendAsync(request, cancellationToken);
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            if (Hang)
+                await Task.Delay(Timeout.Infinite, cancellationToken);
+            return Cut ? throw new HttpRequestException("Network unreachable (simulated).") : await base.SendAsync(request, cancellationToken);
+        }
     }
 
     /// <summary>A clock that moves only when told to, and whose timers never fire.</summary>
