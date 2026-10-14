@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.0]
 
 - Several instances behind a load balancer share one certificate. One orders it under a lock (`IAcmeLock`), held
   until the order succeeds so the others don't multiply retries; the others pick it up from the store without a
