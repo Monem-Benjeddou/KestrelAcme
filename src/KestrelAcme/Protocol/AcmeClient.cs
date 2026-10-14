@@ -133,7 +133,7 @@ internal sealed class AcmeClient
             return null;
 
         var url = new Uri(directory.RenewalInfo.AbsoluteUri.TrimEnd('/') + "/" + certificateId);
-        using var activity = AcmeDiagnostics.StartActivity("renewalInfo", url);
+        using var activity = AcmeDiagnostics.StartActivity("renewalInfo", FromCa(url));
         using var response = await _createHttp().GetAsync(url, cancellationToken).ConfigureAwait(false);
         if (response.StatusCode == HttpStatusCode.NotFound)
             return null;
@@ -160,7 +160,7 @@ internal sealed class AcmeClient
         if (useKid && AccountUrl is null)
             throw new InvalidOperationException("Create the account before sending account-signed requests.");
 
-        using var activity = AcmeDiagnostics.StartActivity("post", url);
+        using var activity = AcmeDiagnostics.StartActivity("post", FromCa(url));
 
         for (var attempt = 1; ; attempt++)
         {
@@ -196,13 +196,17 @@ internal sealed class AcmeClient
         }
     }
 
+    /// <summary>A URL the CA supplied. Only https: a hostile directory must not point requests at internal services.</summary>
+    private static Uri FromCa(Uri url) =>
+        url.Scheme == Uri.UriSchemeHttps ? url : throw new AcmeException($"The certificate authority gave a non-HTTPS URL: {url}");
+
     private async ValueTask<string> TakeNonceAsync(CancellationToken cancellationToken)
     {
         if (_nonces.TryTake(out var nonce))
             return nonce;
 
         var directory = await GetDirectoryAsync(cancellationToken).ConfigureAwait(false);
-        using var request = new HttpRequestMessage(HttpMethod.Head, directory.NewNonce);
+        using var request = new HttpRequestMessage(HttpMethod.Head, FromCa(directory.NewNonce));
         using var response = await _createHttp().SendAsync(request, cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
 

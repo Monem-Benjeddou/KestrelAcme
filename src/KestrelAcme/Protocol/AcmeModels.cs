@@ -91,8 +91,12 @@ internal sealed class AcmeProblem
         var text = $"{Type}: {Detail}";
         if (Subproblems is { Count: > 0 })
             text += " (" + string.Join("; ", Subproblems.Select(p => $"{p.Identifier?.Value}: {p.Detail}")) + ")";
-        return text;
+        return Clean(text);
     }
+
+    /// <summary>The text goes into logs: no newlines or other control characters from the CA.</summary>
+    internal static string Clean(string text) =>
+        text.Any(char.IsControl) ? new string(text.Select(c => char.IsControl(c) ? ' ' : c).ToArray()) : text;
 }
 
 internal sealed class RenewalInfo

@@ -23,8 +23,8 @@ internal sealed class ClientHelloMiddleware(ConnectionDelegate next, ChallengeRe
         connection.Features.Set(clientHello);
 
         // A TLS-ALPN-01 validation for another instance's order. OnAuthenticate can't wait for the store, so the
-        // challenge certificate is loaded here, for this connection only.
-        using var shared = clientHello.Offers(ChallengeResponder.AcmeTlsProtocol) && clientHello.ServerName is { } name
+        // challenge certificate is loaded here. It is owned by ChallengeResponder, not this connection.
+        var shared = clientHello.Offers(ChallengeResponder.AcmeTlsProtocol) && clientHello.ServerName is { } name
             && !challenges.TryGetTlsAlpn01(name, out _)
             ? await challenges.LoadSharedTlsAlpn01Async(name, connection.ConnectionClosed).ConfigureAwait(false)
             : null;
