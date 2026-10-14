@@ -93,7 +93,7 @@ internal sealed class KubernetesLeaseLock(KubernetesApi api, TimeProvider time, 
         value.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.ffffff'Z'", CultureInfo.InvariantCulture);
 
     /// <summary>A held lease: renewed until disposed, then released so the next replica doesn't wait for it to expire.</summary>
-    private sealed class Held : IAsyncDisposable, ILosableLock
+    private sealed class Held : IAcmeLockHandle
     {
         private readonly KubernetesLeaseLock _owner;
         private readonly string _path;
@@ -122,7 +122,12 @@ internal sealed class KubernetesLeaseLock(KubernetesApi api, TimeProvider time, 
                 {
                     await Task.Delay(RenewInterval, _owner._time, _stop.Token).ConfigureAwait(false);
                     _lease["spec"]!["renewTime"] = MicroTime(_owner._time.GetUtcNow());
-                    var (status, lease) = await _owner._api.SendAsync(HttpMethod.Put, _path, _lease, _stop.Token).ConfigureAwait(false);
+
+                    // A request that hangs (packets dropped, not refused) must not outlive the deadline either.
+                    var left = RenewDeadline - _owner._time.GetElapsedTime(_renewedAt);
+                    using var deadline = new CancellationTokenSource(left > TimeSpan.Zero ? left : TimeSpan.Zero, _owner._time);
+                    using var attempt = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token, deadline.Token);
+                    var (status, lease) = await _owner._api.SendAsync(HttpMethod.Put, _path, _lease, attempt.Token).ConfigureAwait(false);
                     if (status is HttpStatusCode.Conflict or HttpStatusCode.NotFound)
                     {
                         await GiveUpAsync().ConfigureAwait(false); // changed or deleted by someone else

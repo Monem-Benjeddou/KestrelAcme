@@ -27,7 +27,7 @@ public sealed class KestrelHookTests : IDisposable
         options.Value.Domains.Add("example.com");
         _store = new FileSystemAcmeStore(_root);
         _selector = new CertificateSelector(options, TimeProvider.System);
-        _challenges = new ChallengeResponder(_store, options, TimeProvider.System, NullLogger<ChallengeResponder>.Instance);
+        _challenges = new ChallengeResponder(_store, new FileSystemAcmeLock(_store), options, TimeProvider.System, NullLogger<ChallengeResponder>.Instance);
         _setup = new KestrelOptionsSetup(_selector, _challenges, NullLogger<KestrelOptionsSetup>.Instance);
     }
 
@@ -75,7 +75,7 @@ public sealed class KestrelHookTests : IDisposable
     [Fact]
     public async Task Tls_alpn_validation_of_another_instances_order_gets_the_shared_challenge_certificate()
     {
-        await _challenges.ShareAsync(_challenges.TlsAlpn01Key("example.com"), "t.k", default);
+        await _challenges.PublishAsync([new SharedAnswer("tls-alpn-01", "example.com", "t.k")], default);
         using var shared = await _challenges.LoadSharedTlsAlpn01Async("EXAMPLE.com", default);
         var connection = Connection(new ClientHello("EXAMPLE.com", ["acme-tls/1"]));
         connection.Features.Set(new SharedTlsAlpn01Challenge(shared!));
@@ -94,7 +94,7 @@ public sealed class KestrelHookTests : IDisposable
     [InlineData("")]
     public async Task No_shared_tls_alpn_certificate_without_a_shared_answer_or_for_odd_names(string name)
     {
-        await _challenges.ShareAsync(_challenges.TlsAlpn01Key("example.com"), "t.k", default);
+        await _challenges.PublishAsync([new SharedAnswer("tls-alpn-01", "example.com", "t.k")], default);
         Assert.Null(await _challenges.LoadSharedTlsAlpn01Async(name, default));
     }
 
@@ -119,9 +119,9 @@ public sealed class KestrelHookTests : IDisposable
     public async Task Http01_answers_known_tokens_and_passes_everything_else_on(string method, string path, int status, string body)
     {
         _challenges.AddHttp01("tok", "tok.thumb");
-        await _challenges.ShareAsync(_challenges.Http01Key(SharedToken), "shared.thumb", default);
+        await _challenges.PublishAsync([new SharedAnswer("http-01", SharedToken, "shared.thumb")], default);
         var app = new ApplicationBuilder(new ServiceCollection().BuildServiceProvider());
-        new Http01ChallengeStartupFilter(_challenges).Configure(a => a.Run(c =>
+        new Http01ChallengeStartupFilter(_challenges, NullLogger<Http01ChallengeStartupFilter>.Instance).Configure(a => a.Run(c =>
         {
             c.Response.StatusCode = 418;
             return Task.CompletedTask;
@@ -137,6 +137,56 @@ public sealed class KestrelHookTests : IDisposable
         Assert.Equal(status, context.Response.StatusCode);
         context.Response.Body.Position = 0;
         Assert.Equal(body, await new StreamReader(context.Response.Body).ReadToEndAsync());
+    }
+
+    [Fact]
+    public async Task Lookups_for_made_up_tokens_read_the_store_at_most_once_per_interval()
+    {
+        var reads = new CountingStore(_store);
+        var options = Options.Create(new AcmeOptions());
+        options.Value.Domains.Add("example.com");
+        var challenges = new ChallengeResponder(reads, new FileSystemAcmeLock(_store), options, TimeProvider.System, NullLogger<ChallengeResponder>.Instance);
+
+        // A flood of requests for tokens nobody published.
+        var flood = Enumerable.Range(0, 500).Select(i => challenges.FindHttp01Async($"made-up-token-{i:D10}-xxxxxxxx", default));
+        Assert.All(await Task.WhenAll(flood), Assert.Null);
+        Assert.Equal(1, reads.Reads);
+
+        // A real answer published meanwhile is found once the interval has passed, as the issuer's PublishDelay ensures.
+        await challenges.PublishAsync([new SharedAnswer("http-01", SharedToken, "shared.thumb")], default);
+        await Task.Delay(ChallengeResponder.MinRefreshInterval);
+        Assert.Equal("shared.thumb", await challenges.FindHttp01Async(SharedToken, default));
+        Assert.Equal(2, reads.Reads);
+    }
+
+    [Fact]
+    public async Task A_custom_store_without_a_lock_is_never_used_for_challenges()
+    {
+        var reads = new CountingStore(_store);
+        var options = Options.Create(new AcmeOptions());
+        options.Value.Domains.Add("example.com");
+        var challenges = new ChallengeResponder(reads, new UncoordinatedAcmeLock(reads, NullLogger<UncoordinatedAcmeLock>.Instance),
+            options, TimeProvider.System, NullLogger<ChallengeResponder>.Instance);
+
+        Assert.False(challenges.Shares);
+        Assert.Null(await challenges.FindHttp01Async(SharedToken, default));
+        Assert.Null(await challenges.LoadSharedTlsAlpn01Async("example.com", default));
+        Assert.Equal(0, reads.Reads);
+    }
+
+    private sealed class CountingStore(IAcmeStore inner) : IAcmeStore
+    {
+        private int _reads;
+
+        public int Reads => _reads;
+
+        public Task<byte[]?> ReadAsync(string key, CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref _reads);
+            return inner.ReadAsync(key, cancellationToken);
+        }
+
+        public Task WriteAsync(string key, byte[] value, CancellationToken cancellationToken) => inner.WriteAsync(key, value, cancellationToken);
     }
 
     [Theory]

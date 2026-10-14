@@ -63,7 +63,7 @@ internal sealed class KubernetesApi(IHttpClientFactory httpClientFactory, IOptio
         roots.ImportFromPemFile(options.CertificateAuthorityPath);
         handler.SslOptions = new SslClientAuthenticationOptions
         {
-            RemoteCertificateValidationCallback = (_, certificate, _, errors) =>
+            RemoteCertificateValidationCallback = (_, certificate, presented, errors) =>
             {
                 if (certificate is null || (errors & ~SslPolicyErrors.RemoteCertificateChainErrors) != SslPolicyErrors.None)
                     return false;
@@ -71,7 +71,10 @@ internal sealed class KubernetesApi(IHttpClientFactory httpClientFactory, IOptio
                 chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
                 chain.ChainPolicy.CustomTrustStore.AddRange(roots);
                 chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
-                return chain.Build(certificate as X509Certificate2 ?? new X509Certificate2(certificate));
+                if (presented is not null)
+                    chain.ChainPolicy.ExtraStore.AddRange(presented.ChainPolicy.ExtraStore); // intermediates the server sent
+                using var copy = certificate as X509Certificate2 is null ? new X509Certificate2(certificate) : null;
+                return chain.Build(certificate as X509Certificate2 ?? copy!);
             },
         };
         return handler;

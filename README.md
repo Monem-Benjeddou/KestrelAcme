@@ -172,8 +172,10 @@ builder.Services.AddSingleton<IAcmeStore, MyKeyVaultStore>();
 
 Replicas of an app behind a load balancer share one certificate. When it's due, one replica takes a lock and
 orders it; the others wait, then load it from the store, without a restart. The lock is held until the order
-succeeds, retries included, so the replicas don't multiply failed attempts against the CA's rate limits. Challenge
-answers go through the store too, so whichever replica the CA reaches can answer.
+succeeds, retries included, so the replicas don't multiply failed attempts against the CA's rate limits, and until
+the certificate is stored. Challenge answers go through the store too: the ordering replica publishes them once per
+order and gives the others 2 s before the CA checks, and each replica reads them at most once a second, however many
+requests arrive, so whichever replica the CA reaches can answer.
 
 **On a shared volume** (NFSv4, SMB/Azure Files, EFS), point every replica's `StoragePath` at it. Nothing else to
 configure: the lock is a file lock, released at once if the replica's process crashes, and by the file server
@@ -205,11 +207,13 @@ rules:
     verbs: [get, create, update]
 ```
 
-Set `o.Name` to keep two apps in one namespace apart. TLS still has to reach the pods: expose them through a
+Set `o.Name` (up to 40 lowercase letters, digits and dashes) to keep two apps in one namespace apart. TLS still has to reach the pods: expose them through a
 `LoadBalancer` Service or a TCP (passthrough) ingress, not one that terminates TLS.
 
 **With a custom `IAcmeStore`**, also register an `IAcmeLock` backed by the same system (a database lock, a blob
-lease); without one, replicas don't coordinate.
+lease). Without one, replicas don't coordinate, nothing is shared through your store, and a log line says so at the
+first order. If your lock can expire while held, have its handle implement `IAcmeLockHandle`, so an order stops
+when the lock is lost.
 
 ### Proxies and custom HTTP settings
 

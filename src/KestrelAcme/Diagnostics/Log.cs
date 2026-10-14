@@ -78,4 +78,13 @@ internal static partial class Log
 
     [LoggerMessage(25, LogLevel.Warning, "Could not renew the Kubernetes lease {Path}; trying again.")]
     public static partial void LeaseRenewalFailed(ILogger logger, string path, Exception exception);
+
+    [LoggerMessage(26, LogLevel.Information, "The certificate store {StoreType} has no IAcmeLock: fine for one instance, but several instances sharing it each order their own certificate. Register an IAcmeLock to coordinate them.")]
+    public static partial void Uncoordinated(ILogger logger, string storeType);
+
+    [LoggerMessage(27, LogLevel.Warning, "The certificate store could not be read; trying again at the first check.")]
+    public static partial void StoreUnreadable(ILogger logger, Exception exception);
+
+    [LoggerMessage(28, LogLevel.Debug, "Answering the HTTP-01 challenge for {Domain}.")]
+    public static partial void Http01ChallengeServed(ILogger logger, string domain);
 }

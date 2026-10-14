@@ -1,4 +1,5 @@
 using KestrelAcme.Hosting;
+using KestrelAcme.Storage;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -20,45 +21,98 @@ public sealed class ReplicaTests(PebbleFixture pebble, ITestOutputHelper output)
     [PebbleFact]
     public async Task Replicas_starting_together_order_once_and_serve_the_same_certificate()
     {
-        PebbleDnsProvider dnsA = new(), dnsB = new();
+        // Counted from the logs: with a shared account, a second order could reuse the first one's authorization and
+        // create no DNS record, so records don't tell.
+        var orders = new OrderCounter();
         var startA = TestApp.StartAsync(pebble, output, "replicas.kestrelacme.test", _storage, Dns01Only,
-            services => services.AddSingleton<IDnsChallengeProvider>(dnsA));
+            services => services.AddSingleton<IDnsChallengeProvider>(new PebbleDnsProvider()).AddSingleton<ILoggerProvider>(orders));
         var startB = TestApp.StartAsync(pebble, output, "replicas.kestrelacme.test", _storage, Dns01Only,
-            services => services.AddSingleton<IDnsChallengeProvider>(dnsB), OtherHttpPort, OtherTlsPort);
+            services => services.AddSingleton<IDnsChallengeProvider>(new PebbleDnsProvider()).AddSingleton<ILoggerProvider>(orders),
+            OtherHttpPort, OtherTlsPort);
         await using var a = await startA;
         await using var b = await startB;
 
         var issuedA = await a.WaitForCertificateAsync();
         var issuedB = await b.WaitForCertificateAsync();
 
-        Assert.Equal(1, dnsA.Added.Count + dnsB.Added.Count); // one order in total
+        Assert.Equal(1, orders.Count);
         Assert.Equal(issuedA.Leaf.Thumbprint, issuedB.Leaf.Thumbprint);
     }
 
     [PebbleFact]
-    public async Task Http01_challenges_are_answered_by_the_replica_that_receives_them()
-    {
-        await using var a = await TestApp.StartAsync(pebble, output, "a.replicas.kestrelacme.test", _storage,
-            o => o.Challenges = AcmeChallengeTypes.Http01);
-        await using var b = await TestApp.StartAsync(pebble, output, "b.replicas.kestrelacme.test", _storage,
-            o => o.Challenges = AcmeChallengeTypes.Http01, httpPort: OtherHttpPort, tlsPort: OtherTlsPort);
+    public Task Http01_challenges_are_answered_by_a_replica_that_isnt_ordering() => AnsweredByAnotherReplicaAsync(AcmeChallengeTypes.Http01);
 
-        await b.WaitForCertificateAsync(); // validated through A
-        await a.WaitForCertificateAsync(); // A's own order done too, before checking that the answers were removed
+    [PebbleFact]
+    public Task Tls_alpn01_challenges_are_answered_by_a_replica_that_isnt_ordering() => AnsweredByAnotherReplicaAsync(AcmeChallengeTypes.TlsAlpn01);
+
+    private async Task AnsweredByAnotherReplicaAsync(AcmeChallengeTypes type)
+    {
+        var domain = $"{type}.shared.kestrelacme.test".ToLowerInvariant();
+        var orders = new OrderCounter();
+
+        // B orders, listening where Pebble doesn't validate.
+        await using var b = await TestApp.StartAsync(pebble, output, domain, _storage, o => o.Challenges = type,
+            services => services.AddSingleton<ILoggerProvider>(orders), OtherHttpPort, OtherTlsPort);
+        await orders.FirstOrder.WaitAsync(TimeSpan.FromSeconds(10));
+
+        // A starts while B's order runs, where Pebble validates: it answers B's challenges, then picks up B's certificate.
+        await using var a = await TestApp.StartAsync(pebble, output, domain, _storage, o => o.Challenges = type,
+            services => services.AddSingleton<ILoggerProvider>(orders));
+
+        var issued = await b.WaitForCertificateAsync();
+        Assert.Equal(issued.Leaf.Thumbprint, (await a.WaitForCertificateAsync()).Leaf.Thumbprint);
+        Assert.Equal(1, orders.Count);
         Assert.Empty(Directory.GetFiles(Path.Combine(_storage, "challenges"), "*", SearchOption.AllDirectories));
     }
 
     [PebbleFact]
-    public async Task Tls_alpn01_challenges_are_answered_by_the_replica_that_receives_them()
+    public async Task The_lock_is_kept_until_the_certificate_is_stored()
     {
-        await using var a = await TestApp.StartAsync(pebble, output, "a.replicas.kestrelacme.test", _storage,
-            o => o.Challenges = AcmeChallengeTypes.TlsAlpn01);
-        await using var b = await TestApp.StartAsync(pebble, output, "b.replicas.kestrelacme.test", _storage,
-            o => o.Challenges = AcmeChallengeTypes.TlsAlpn01, httpPort: OtherHttpPort, tlsPort: OtherTlsPort);
+        // A's store takes everything but the certificate, so A can't hand it over.
+        var orders = new OrderCounter();
+        PebbleDnsProvider dnsA = new(), dnsB = new();
+        await using var a = await TestApp.StartAsync(pebble, output, "unsaved.kestrelacme.test", _storage, Dns01Only, services => services
+            .AddSingleton<ILoggerProvider>(orders).AddSingleton<IDnsChallengeProvider>(dnsA)
+            .AddSingleton<IAcmeStore>(new FlakyStore(new FileSystemAcmeStore(_storage), failWrites: true))
+            .AddSingleton<IAcmeLock>(new FileSystemAcmeLock(new FileSystemAcmeStore(_storage))));
+        await a.WaitForCertificateAsync(); // issued and served, not stored
 
-        await b.WaitForCertificateAsync(); // validated through A
-        await a.WaitForCertificateAsync(); // A's own order done too, before checking that the answers were removed
-        Assert.Empty(Directory.GetFiles(Path.Combine(_storage, "challenges"), "*", SearchOption.AllDirectories));
+        await using var b = await TestApp.StartAsync(pebble, output, "unsaved.kestrelacme.test", _storage, Dns01Only,
+            services => services.AddSingleton<ILoggerProvider>(orders).AddSingleton<IDnsChallengeProvider>(dnsB),
+            OtherHttpPort, OtherTlsPort);
+        await Task.Delay(AcmeRenewalService.LockedRetry + TimeSpan.FromSeconds(5));
+
+        Assert.Equal(1, orders.Count); // B didn't order again while A still has to store it
+    }
+
+    [PebbleFact]
+    public async Task A_store_that_cant_be_read_doesnt_lead_to_an_order()
+    {
+        var orders = new OrderCounter();
+        await using var app = await TestApp.StartAsync(pebble, output, "unreadable.kestrelacme.test", _storage, Dns01Only, services => services
+            .AddSingleton<ILoggerProvider>(orders).AddSingleton<IDnsChallengeProvider>(new PebbleDnsProvider())
+            .AddSingleton<IAcmeStore>(new FlakyStore(new FileSystemAcmeStore(_storage), failReads: true))
+            .AddSingleton<IAcmeLock>(new FileSystemAcmeLock(new FileSystemAcmeStore(_storage))));
+
+        await Task.Delay(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(0, orders.Count); // backing off instead of taking the error for "no certificate"
+    }
+
+    /// <summary>A store whose certificate reads or writes fail, like an API server having a bad moment.</summary>
+    private sealed class FlakyStore(IAcmeStore inner, bool failReads = false, bool failWrites = false) : IAcmeStore
+    {
+        public Task<byte[]?> ReadAsync(string key, CancellationToken cancellationToken) =>
+            failReads && key.StartsWith("certificates/", StringComparison.Ordinal)
+                ? throw new IOException("Store unavailable (simulated).")
+                : inner.ReadAsync(key, cancellationToken);
+
+        public Task WriteAsync(string key, byte[] value, CancellationToken cancellationToken) =>
+            failWrites && key.StartsWith("certificates/", StringComparison.Ordinal)
+                ? throw new IOException("Store unavailable (simulated).")
+                : inner.WriteAsync(key, value, cancellationToken);
+
+        public Task DeleteAsync(string key, CancellationToken cancellationToken) => inner.DeleteAsync(key, cancellationToken);
     }
 
     [PebbleFact]
@@ -83,32 +137,6 @@ public sealed class ReplicaTests(PebbleFixture pebble, ITestOutputHelper output)
     {
         o.Challenges = AcmeChallengeTypes.Dns01;
         o.DnsPropagationDelay = TimeSpan.Zero;
-    }
-
-    /// <summary>Counts order attempts, from the issuer's "Ordering a certificate" log entries.</summary>
-    private sealed class OrderCounter : ILoggerProvider, ILogger
-    {
-        private int _count;
-
-        public int Count => _count;
-
-        public ILogger CreateLogger(string categoryName) => categoryName.EndsWith(".AcmeCertificateIssuer", StringComparison.Ordinal)
-            ? this
-            : NullLogger.Instance;
-
-        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
-
-        public bool IsEnabled(LogLevel logLevel) => true;
-
-        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
-        {
-            if (eventId.Id == 6) // Log.Ordering
-                Interlocked.Increment(ref _count);
-        }
-
-        public void Dispose()
-        {
-        }
     }
 
     public void Dispose()

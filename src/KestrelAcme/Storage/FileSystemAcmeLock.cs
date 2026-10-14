@@ -1,3 +1,5 @@
+using Microsoft.Extensions.Logging;
+
 namespace KestrelAcme.Storage;
 
 /// <summary>
@@ -42,10 +44,17 @@ internal sealed class FileSystemAcmeLock(FileSystemAcmeStore store) : IAcmeLock
 /// The lock used with a custom <see cref="IAcmeStore"/> when no <see cref="IAcmeLock"/> is registered: always granted,
 /// so a single instance works as before and several instances don't coordinate.
 /// </summary>
-internal sealed class UncoordinatedAcmeLock : IAcmeLock, IAsyncDisposable
+internal sealed class UncoordinatedAcmeLock(IAcmeStore store, ILogger<UncoordinatedAcmeLock> logger) : IAcmeLock, IAsyncDisposable
 {
-    public Task<IAsyncDisposable?> TryAcquireAsync(string name, CancellationToken cancellationToken) =>
-        Task.FromResult<IAsyncDisposable?>(this);
+    private int _logged;
+
+    public Task<IAsyncDisposable?> TryAcquireAsync(string name, CancellationToken cancellationToken)
+    {
+        // Said once, when the first order starts: running replicas on such a store silently ordered per replica.
+        if (Interlocked.Exchange(ref _logged, 1) == 0)
+            Log.Uncoordinated(logger, store.GetType().Name);
+        return Task.FromResult<IAsyncDisposable?>(this);
+    }
 
     public ValueTask DisposeAsync() => default;
 }
