@@ -236,6 +236,9 @@ internal sealed class AcmeCertificateIssuer(
                     challenges.RemoveHttp01(challenge.Token);
                     return Task.CompletedTask;
                 });
+                var http01Key = challenges.Http01Key(challenge.Token);
+                await challenges.ShareAsync(http01Key, keyAuthorization, cancellationToken).ConfigureAwait(false);
+                cleanup.Add(() => challenges.UnshareAsync(http01Key));
                 break;
 
             case AcmeChallenge.TlsAlpn01:
@@ -246,6 +249,9 @@ internal sealed class AcmeCertificateIssuer(
                         certificate.Retire(time);
                     return Task.CompletedTask;
                 });
+                var tlsAlpn01Key = challenges.TlsAlpn01Key(domain);
+                await challenges.ShareAsync(tlsAlpn01Key, keyAuthorization, cancellationToken).ConfigureAwait(false);
+                cleanup.Add(() => challenges.UnshareAsync(tlsAlpn01Key));
                 break;
 
             case AcmeChallenge.Dns01:

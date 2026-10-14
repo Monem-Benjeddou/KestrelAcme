@@ -1,6 +1,7 @@
 using System.Net.Security;
 using KestrelAcme.Certificates;
 using KestrelAcme.Hosting;
+using KestrelAcme.Storage;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Connections;
 using Microsoft.AspNetCore.Http;
@@ -10,17 +11,23 @@ using Microsoft.Extensions.Options;
 
 namespace KestrelAcme.Tests;
 
-public class KestrelHookTests
+public sealed class KestrelHookTests : IDisposable
 {
+    private const string SharedToken = "shared-token_0123456789abcdef";
+
+    private readonly string _root = Directory.CreateTempSubdirectory("kestrelacme-hooks-").FullName;
+    private readonly FileSystemAcmeStore _store;
     private readonly CertificateSelector _selector;
-    private readonly ChallengeResponder _challenges = new();
+    private readonly ChallengeResponder _challenges;
     private readonly KestrelOptionsSetup _setup;
 
     public KestrelHookTests()
     {
-        var options = new AcmeOptions();
-        options.Domains.Add("example.com");
-        _selector = new CertificateSelector(Options.Create(options), TimeProvider.System);
+        var options = Options.Create(new AcmeOptions());
+        options.Value.Domains.Add("example.com");
+        _store = new FileSystemAcmeStore(_root);
+        _selector = new CertificateSelector(options, TimeProvider.System);
+        _challenges = new ChallengeResponder(_store, options, TimeProvider.System, NullLogger<ChallengeResponder>.Instance);
         _setup = new KestrelOptionsSetup(_selector, _challenges, NullLogger<KestrelOptionsSetup>.Instance);
     }
 
@@ -66,6 +73,32 @@ public class KestrelHookTests
     }
 
     [Fact]
+    public async Task Tls_alpn_validation_of_another_instances_order_gets_the_shared_challenge_certificate()
+    {
+        await _challenges.ShareAsync(_challenges.TlsAlpn01Key("example.com"), "t.k", default);
+        using var shared = await _challenges.LoadSharedTlsAlpn01Async("EXAMPLE.com", default);
+        var connection = Connection(new ClientHello("EXAMPLE.com", ["acme-tls/1"]));
+        connection.Features.Set(new SharedTlsAlpn01Challenge(shared!));
+        var ssl = new SslServerAuthenticationOptions { ServerCertificate = _selector.Placeholder.Leaf };
+
+        _setup.OnAuthenticate(connection, ssl);
+
+        Assert.Same(shared!.Context, ssl.ServerCertificateContext);
+        Assert.Equal([new SslApplicationProtocol("acme-tls/1")], ssl.ApplicationProtocols);
+    }
+
+    [Theory]
+    [InlineData("other.example.com")]
+    [InlineData("../accounts")]
+    [InlineData("*.example.com")]
+    [InlineData("")]
+    public async Task No_shared_tls_alpn_certificate_without_a_shared_answer_or_for_odd_names(string name)
+    {
+        await _challenges.ShareAsync(_challenges.TlsAlpn01Key("example.com"), "t.k", default);
+        Assert.Null(await _challenges.LoadSharedTlsAlpn01Async(name, default));
+    }
+
+    [Fact]
     public void Acme_protocol_without_a_pending_challenge_gets_the_normal_certificate()
     {
         var ssl = new SslServerAuthenticationOptions { ServerCertificate = _selector.Placeholder.Leaf };
@@ -81,9 +114,12 @@ public class KestrelHookTests
     [InlineData("GET", "/.well-known/acme-challenge/unknown", 418, "")]
     [InlineData("GET", "/.well-known/acme-challenge/", 418, "")]
     [InlineData("GET", "/other", 418, "")]
+    [InlineData("GET", "/.well-known/acme-challenge/" + SharedToken, 200, "shared.thumb")] // another instance's order
+    [InlineData("GET", "/.well-known/acme-challenge/..%2F..%2Faccounts", 418, "")]
     public async Task Http01_answers_known_tokens_and_passes_everything_else_on(string method, string path, int status, string body)
     {
         _challenges.AddHttp01("tok", "tok.thumb");
+        await _challenges.ShareAsync(_challenges.Http01Key(SharedToken), "shared.thumb", default);
         var app = new ApplicationBuilder(new ServiceCollection().BuildServiceProvider());
         new Http01ChallengeStartupFilter(_challenges).Configure(a => a.Run(c =>
         {
@@ -103,10 +139,20 @@ public class KestrelHookTests
         Assert.Equal(body, await new StreamReader(context.Response.Body).ReadToEndAsync());
     }
 
+    [Theory]
+    [InlineData("abcdefghijklmnopqrstuvwxyz_-0123456789", true)]
+    [InlineData("short", false)]
+    [InlineData("..%2F..%2Faccounts%2Fca%2Faccount.pem", false)]
+    [InlineData("abcdefghijklmnopqrstuv/w", false)]
+    public void Only_token_shaped_strings_are_looked_up(string token, bool expected) =>
+        Assert.Equal(expected, ChallengeResponder.IsToken(token));
+
     private static DefaultConnectionContext Connection(ClientHello hello)
     {
         var connection = new DefaultConnectionContext();
         connection.Features.Set(hello);
         return connection;
     }
+
+    public void Dispose() => Directory.Delete(_root, recursive: true);
 }

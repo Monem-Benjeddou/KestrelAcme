@@ -6,7 +6,8 @@ namespace KestrelAcme.Hosting;
 
 /// <summary>
 /// Answers HTTP-01 challenges (RFC 8555 §8.3) ahead of the app's own middleware, so HTTPS redirection,
-/// authentication or routing can't get in the way. Unknown tokens fall through to the app.
+/// authentication or routing can't get in the way. Tokens of another instance's order are answered from the store;
+/// unknown tokens fall through to the app.
 /// </summary>
 internal sealed class Http01ChallengeStartupFilter(ChallengeResponder challenges) : IStartupFilter
 {
@@ -18,7 +19,7 @@ internal sealed class Http01ChallengeStartupFilter(ChallengeResponder challenges
             if (HttpMethods.IsGet(request.Method)
                 && request.Path.StartsWithSegments(ChallengeResponder.Http01PathPrefix.TrimEnd('/'), out var rest)
                 && rest.Value is { Length: > 1 } tokenPath
-                && challenges.TryGetHttp01(tokenPath[1..], out var keyAuthorization))
+                && await challenges.FindHttp01Async(tokenPath[1..], context.RequestAborted).ConfigureAwait(false) is { } keyAuthorization)
             {
                 context.Response.ContentType = "application/octet-stream";
                 await context.Response.WriteAsync(keyAuthorization, context.RequestAborted).ConfigureAwait(false);

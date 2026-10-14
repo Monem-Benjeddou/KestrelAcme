@@ -11,7 +11,7 @@ namespace KestrelAcme.Storage;
 /// </summary>
 internal sealed class FileSystemAcmeStore : IAcmeStore
 {
-    private const UnixFileMode OwnerOnlyFile = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+    internal const UnixFileMode OwnerOnlyFile = UnixFileMode.UserRead | UnixFileMode.UserWrite;
     private const UnixFileMode OwnerOnlyDirectory = OwnerOnlyFile | UnixFileMode.UserExecute;
 
     private readonly string _root;
@@ -73,6 +73,18 @@ internal sealed class FileSystemAcmeStore : IAcmeStore
         }
     }
 
+    public Task DeleteAsync(string key, CancellationToken cancellationToken)
+    {
+        try
+        {
+            File.Delete(Resolve(key)); // no error if the file doesn't exist
+        }
+        catch (DirectoryNotFoundException)
+        {
+        }
+        return Task.CompletedTask;
+    }
+
     /// <summary>Maps a key to a path inside the root, rejecting keys that would escape it.</summary>
     internal string Resolve(string key)
     {
@@ -84,7 +96,7 @@ internal sealed class FileSystemAcmeStore : IAcmeStore
         return path;
     }
 
-    private static void CreateDirectory(string path)
+    internal static void CreateDirectory(string path)
     {
         if (Directory.Exists(path))
             return;
