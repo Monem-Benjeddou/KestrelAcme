@@ -76,7 +76,7 @@ public sealed class KestrelHookTests : IDisposable
     public async Task Tls_alpn_validation_of_another_instances_order_gets_the_shared_challenge_certificate()
     {
         await _challenges.PublishAsync([new SharedAnswer("tls-alpn-01", "example.com", "t.k")], default);
-        using var shared = await _challenges.LoadSharedTlsAlpn01Async("EXAMPLE.com", default);
+        var shared = await _challenges.LoadSharedTlsAlpn01Async("EXAMPLE.com", default);
         var connection = Connection(new ClientHello("EXAMPLE.com", ["acme-tls/1"]));
         connection.Features.Set(new SharedTlsAlpn01Challenge(shared!));
         var ssl = new SslServerAuthenticationOptions { ServerCertificate = _selector.Placeholder.Leaf };
@@ -137,6 +137,23 @@ public sealed class KestrelHookTests : IDisposable
         Assert.Equal(status, context.Response.StatusCode);
         context.Response.Body.Position = 0;
         Assert.Equal(body, await new StreamReader(context.Response.Body).ReadToEndAsync());
+    }
+
+    [Fact]
+    public async Task The_shared_tls_alpn_certificate_is_built_once_and_retired_when_the_answer_goes()
+    {
+        await _challenges.PublishAsync([new SharedAnswer("tls-alpn-01", "example.com", "t.k")], default);
+
+        // A flood of acme-tls/1 connections for the same name: one key generation, not one per connection.
+        var loads = await Task.WhenAll(Enumerable.Range(0, 200).Select(_ => _challenges.LoadSharedTlsAlpn01Async("example.com", default)));
+        Assert.All(loads, c => Assert.Same(loads[0], c));
+
+        // The answer is removed; once the copy is stale, the certificate is retired and no longer served.
+        await _challenges.UnpublishAsync();
+        await Task.Delay(ChallengeResponder.MinRefreshInterval);
+        Assert.Same(loads[0], await _challenges.LoadSharedTlsAlpn01Async("example.com", default)); // hit: not re-read yet
+        await Task.Delay(ChallengeResponder.MaxAge);
+        Assert.Null(await _challenges.LoadSharedTlsAlpn01Async("example.com", default));
     }
 
     [Fact]

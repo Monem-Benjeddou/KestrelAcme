@@ -1,5 +1,21 @@
 # Changelog
 
+## [Unreleased]
+
+Fixes from a security review. Nothing let an anonymous client obtain a certificate or read keys; these close
+resource-exhaustion and hostile-CA paths:
+
+- The TLS-ALPN-01 certificate for another instance's answer is built once and shared between connections, not
+  generated per connection, and dropped a minute after the answer is withdrawn. Anyone offering `acme-tls/1` could
+  otherwise make a replica generate a key per connection.
+- Identifiers the CA asks to validate must be ones that were ordered; a hostile CA could otherwise make the app
+  create DNS records or serve challenge certificates for other names.
+- Every URL the CA supplies must be https, and CA responses are capped at 1 MB.
+- The Kubernetes service account token is redacted from `HttpClient` trace logging.
+- Problem text from the CA has control characters removed before it reaches the logs.
+- An instance whose order was cancelled (lost lease) no longer removes the published answers, which may by then be
+  the next holder's.
+
 ## [0.2.1]
 
 Fixes from a review of the multi-instance support, all with tests:

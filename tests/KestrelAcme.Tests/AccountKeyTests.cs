@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using KestrelAcme.Protocol;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace KestrelAcme.Tests;
 
@@ -94,5 +95,43 @@ public class AccountKeyTests
         using var jwk = JsonDocument.Parse(Base64Url.Decode(payloadPart));
         Assert.Equal(key.X, jwk.RootElement.GetProperty("x").GetString());
         Assert.Equal(key.Y, jwk.RootElement.GetProperty("y").GetString());
+    }
+
+    [Theory]
+    [InlineData("https://ca.example/acme/new-order", true)]
+    [InlineData("http://169.254.169.254/latest/meta-data/", false)]
+    [InlineData("http://ca.example/acme/new-order", false)]
+    public async Task Only_https_urls_from_the_certificate_authority_are_called(string url, bool allowed)
+    {
+        // A hostile directory pointing newNonce at an internal service.
+        var directory = $$"""{"newNonce":"{{url}}","newAccount":"https://ca.example/acc","newOrder":"https://ca.example/order"}""";
+        var calls = new List<Uri>();
+        var client = new AcmeClient(() => new HttpClient(new StubHandler(request =>
+        {
+            calls.Add(request.RequestUri!);
+            return request.Method == HttpMethod.Get
+                ? new HttpResponseMessage(System.Net.HttpStatusCode.OK) { Content = new StringContent(directory, System.Text.Encoding.UTF8, "application/json") }
+                : new HttpResponseMessage(System.Net.HttpStatusCode.OK) { Headers = { { "Replay-Nonce", "n" } } };
+        })), new Uri("https://ca.example/directory"), AccountKey.Generate(), NullLogger.Instance);
+
+        var attempt = client.CreateAccountAsync(null, true, null, default);
+        if (allowed)
+            await Assert.ThrowsAnyAsync<Exception>(() => attempt); // gets past the nonce; the stub has no account endpoint
+        else
+            Assert.Contains("non-HTTPS", (await Assert.ThrowsAsync<AcmeException>(() => attempt)).Message);
+        Assert.Equal(allowed, calls.Any(u => u.AbsoluteUri == url));
+    }
+
+    [Fact]
+    public void Problem_text_from_the_certificate_authority_has_no_control_characters()
+    {
+        var problem = new AcmeProblem { Type = "urn:ietf:params:acme:error:malformed", Detail = "line one\nINFO fake log line\r\n\t" };
+        Assert.Equal("urn:ietf:params:acme:error:malformed: line one INFO fake log line   ", problem.ToString());
+    }
+
+    private sealed class StubHandler(Func<HttpRequestMessage, HttpResponseMessage> respond) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+            Task.FromResult(respond(request));
     }
 }
