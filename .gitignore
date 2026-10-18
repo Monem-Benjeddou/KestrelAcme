@@ -2,8 +2,8 @@ bin/
 obj/
 artifacts/
 .pebble/
-temp_auto_push.bat
 .kind/
+temp_auto_push.bat
 .vs/
 .idea/
 *.user
